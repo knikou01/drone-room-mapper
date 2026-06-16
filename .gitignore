@@ -1,0 +1,58 @@
+# ------------------------
+# Python
+# ------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# ------------------------
+# Virtual environments
+# ------------------------
+.venv/
+venv/
+ENV/
+env/
+
+# ------------------------
+# Testing / tooling
+# ------------------------
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ------------------------
+# Environment variables / secrets
+# ------------------------
+.env
+.env.*
+!.env.example
+
+# ------------------------
+# IDEs / editors
+# ------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ------------------------
+# OS files
+# ------------------------
+.DS_Store
+Thumbs.db
+
+# ------------------------
+# Python version managers
+# ------------------------
+.python-version
+
+# ------------------------
+# Logs
+# ------------------------
+*.log
