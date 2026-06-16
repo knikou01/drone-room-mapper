@@ -1,2 +1,1 @@
-# drone-room-mapper
-Room mapping with agentic drones
+Work in progress
