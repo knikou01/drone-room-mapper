@@ -5,14 +5,23 @@ description = "Simulation tool for drone with DimOS mapping a room"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "dimos[base,drone] @ git+https://github.com/dimensionalOS/dimos.git"
+    "dimos[base,drone] @ git+https://github.com/dimensionalOS/dimos.git",
+    # agentic explorer
+    "Pillow",           # costmap image rendering in AgenticFrontierSelector
+    "google-genai",     # Gemini API (free tier) for LLM frontier selection
+    "python-dotenv",    # loads GEMINI_API_KEY (and others) from .env
+    # simulated camera (SimCameraModule)
+    "pybullet",         # PyBullet room rendering and depth capture
+    # real drone depth mapping (DroneDepthModule)
+    "transformers",     # Depth Anything V2 inference pipeline
+    "torch",            # CPU-only, required by transformers depth models
 ]
 
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["rooms", "simulation", "blueprints"]
+packages = ["rooms", "simulation", "blueprints", "drone", "sim_camera"]
 
 [build-system]
 requires = ["hatchling"]
