@@ -100,6 +100,20 @@ _vis = vis_module(global_config.viewer, rerun_config=_rerun_config)
 sim_dimsim_vo_only = autoconnect(
     _vis,
     DimSimCameraModule.blueprint(),
+    # PHASE 3 RE-TEST (2026-07-20), RULED OUT: tracking_method="dense" was
+    # tried here explicitly, since Direction B's async DimSim readback
+    # fix removed dense odometry's original blocker (the ~1-1.2s
+    # pairing_gap breaking its small-motion assumption). Confirmed live
+    # this does NOT help and is actually worse than "sparse": under real
+    # (non-best-case) load, pairing_gap still varied 1000-13000ms in this
+    # run, and dense reproduced its exact original documented failure
+    # mode -- success_rate climbed to 95-97% while the tracked pose was
+    # frozen/near-identity (e.g. vo=0.014m/0.0deg while the robot had
+    # actually moved gt=0.521m/82.5deg). That's a materially WORSE failure
+    # mode than sparse's low success rate: dense reports confident false
+    # success instead of failing safely. Left as module default ("sparse")
+    # -- do not re-enable dense without new evidence changing this
+    # conclusion.
     DimSimVisualOdometryModule.blueprint(),
     MovementManager.blueprint(),
 )

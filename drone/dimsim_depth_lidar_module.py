@@ -40,12 +40,21 @@ NOT the original "/lidar" topic. If VoxelGridMapper is still receiving
 DimSim's raw raycast data instead, the remapping did not take effect.
 ------------------------------------------------------------------------
 
-Pose source: ground-truth /odom (same raw-LCM pattern as
-DimSimVisualOdometryModule and DimSimCameraModule), NOT odom_vo. Phase 2
-is testing whether depth-derived POINTS make a good map, independent of
-whether VO's POSE is trustworthy yet -- that combination is Phase 3, and
-should only be attempted after Phase 1's divergence numbers are reviewed
-under confirmed real motion (not yet done as of this module's writing).
+Pose source: a standard DimOS `odom: In[PoseStamped]` stream (PHASE 3
+CHANGE, 2026-07-20 -- was a hardcoded raw-LCM `/odom` subscription,
+identical in effect but not remappable via blueprint .remappings() the
+way every other pose-consuming module in this codebase is). Ground truth
+`/odom` still resolves here by DEFAULT (DimOS's name-based topic
+resolution for a stream literally named "odom" happens to match DimSim's
+raw ground-truth topic string, same reasoning as
+ReplanningAStarPlanner.odom/WavefrontFrontierExplorer.odom -- see
+sim_dimsim_vo_nav_blueprint.py) -- but a blueprint can now remap this to
+`odom_vo` just like those, so the MAP itself (not just navigation
+decisions) can be built entirely from VO instead of ground truth. Only
+the odom subscription changed -- the depth-image subscription below stays
+on the raw-LCM pattern, since that one exists for a different, still-valid
+reason (DimSim's bridge publishes depth unconditionally regardless of
+blueprint, matching DimSimCameraModule's own color-image pattern).
 
 Projection math verified in test_depth_lidar_projection.py against
 synthetic flat-wall geometry at two headings before this module was
@@ -62,10 +71,11 @@ import math
 import time
 
 import numpy as np
+from reactivex.disposable import Disposable
 
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
-from dimos.core.stream import Out
+from dimos.core.stream import In, Out
 from dimos.protocol.pubsub.impl.lcmpubsub import LCM, Topic
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.sensor_msgs.Image import Image
@@ -78,7 +88,6 @@ from sim_camera.dimsim_camera_module import make_camera_info_default
 # DimSimVisualOdometryModule for the same reasoning (those constants are
 # underscore-prefixed/private, not a stable cross-module contract).
 _RAW_DEPTH_TOPIC = "/depth_image"
-_RAW_ODOM_TOPIC = "/odom"
 
 logger = setup_logger()
 
@@ -103,6 +112,13 @@ class DimSimDepthLidarModule(Module):
 
     config: DimSimDepthLidarConfig
 
+    # PHASE 3 CHANGE (2026-07-20): was a hardcoded raw-LCM "/odom"
+    # subscription -- see module docstring's "Pose source" section. Named
+    # "odom" (not e.g. "pose") specifically so it matches
+    # ReplanningAStarPlanner.odom/WavefrontFrontierExplorer.odom's own
+    # default DimOS topic resolution, and so the SAME .remappings() entry
+    # style used for those (`(cls, "odom", "odom_vo")`) works here too.
+    odom: In[PoseStamped]
     depth_lidar: Out[PointCloud2]
 
     def __init__(self, **kwargs) -> None:
@@ -117,10 +133,10 @@ class DimSimDepthLidarModule(Module):
 
     @rpc
     def start(self) -> None:
+        self.register_disposable(Disposable(self.odom.subscribe(self._on_odom)))
         self._lcm = LCM()
         self._lcm.start()
         self._lcm.subscribe(Topic(_RAW_DEPTH_TOPIC, Image), self._on_depth_image)
-        self._lcm.subscribe(Topic(_RAW_ODOM_TOPIC, PoseStamped), self._on_odom)
         logger.info(
             "DimSimDepthLidarModule started -- publishing on 'depth_lidar', "
             "blueprint MUST remap VoxelGridMapper.lidar to consume it "
@@ -133,7 +149,7 @@ class DimSimDepthLidarModule(Module):
             self._lcm.stop()
         super().stop()
 
-    def _on_odom(self, msg: PoseStamped, topic) -> None:
+    def _on_odom(self, msg: PoseStamped) -> None:
         p = msg.position
         self._pos = (float(p.x), float(p.y), float(p.z))
         q = msg.orientation

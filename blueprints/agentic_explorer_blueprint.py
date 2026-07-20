@@ -91,8 +91,6 @@ drone_agentic_explorer = autoconnect(
     AgenticFrontierSelector.blueprint(
         llm_provider="gemini",
         llm_model="gemini-3.5-flash",
-        frontier_candidates_k=5,
-        min_frontier_clearance_m=0.95,
     ),
     PatrollingModule.blueprint(),
     ReplanningAStarPlanner.blueprint(),
