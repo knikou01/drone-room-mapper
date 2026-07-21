@@ -49,6 +49,21 @@ texture for reliable ORB matching -- real-world success rate has been
 observed in the single digits percent. _reject_counts (see __init__)
 tracks which check is responsible, surfaced in the periodic divergence log.
 
+"learned" -- same 3D-3D RANSAC/Kabsch backend as "sparse"
+(_rigid_fit_from_correspondences), but correspondences come from DISK
+(a learned keypoint detector+descriptor) + LightGlue (a learned matcher)
+instead of ORB + brute-force Hamming matching -- see
+_compute_transform_learned. Learned features are generally far more
+robust than ORB's hand-crafted ones on low-texture/repetitive imagery,
+which is the dominant failure mode "sparse" hits against DimSim's actual
+rendered scenes (see _reject_counts breakdown above). Meaningfully more
+expensive per frame than ORB -- a CNN forward pass per image plus a
+transformer-based matcher, versus ORB's binary descriptors and Hamming
+distance. Runs on CUDA automatically if available
+(torch.cuda.is_available()), CPU otherwise; CPU is roughly 1 second per
+frame pair on a modest machine, far too slow for real-time tracking, so
+this is only practical with a GPU. Not the default -- opt in explicitly.
+
 ------------------------------------------------------------------------
 Design notes:
 ------------------------------------------------------------------------
@@ -105,15 +120,21 @@ logger = setup_logger()
 
 
 class DimSimVisualOdometryConfig(ModuleConfig):
-    tracking_method: Literal["dense", "sparse"] = "sparse"
+    tracking_method: Literal["dense", "sparse", "learned"] = "sparse"
     min_depth_m: float = 0.05
     max_depth_m: float = 15.0
-    # ORB/RANSAC tuning for tracking_method="sparse" -- unused when "dense".
+    # ORB/RANSAC tuning for tracking_method="sparse" -- unused otherwise.
     orb_n_features: int = 500
     # Lowe's ratio test threshold for BFMatcher.knnMatch(k=2) -- standard
     # default (0.75), rejects ambiguous matches where the best and
     # second-best match are too close in descriptor distance to trust.
     orb_ratio_test_threshold: float = 0.75
+    # Max keypoints DISK detects per frame for tracking_method="learned" --
+    # unused otherwise. 1024 matches the value validated in this module's
+    # own correctness tests; increasing it raises correspondence count (and
+    # cost) further, decreasing it saves compute at the risk of too few
+    # matches surviving into a low-texture region of the scene.
+    learned_max_keypoints: int = 1024
     # Inlier distance threshold (metres) for cv2.estimateAffine3D's
     # internal RANSAC -- how far a matched 3D-3D correspondence pair is
     # allowed to deviate from the fitted rigid transform before being
@@ -126,7 +147,7 @@ class DimSimVisualOdometryConfig(ModuleConfig):
     # among too few points. See max_linear_mps/max_angular_rps below for a
     # second, independent line of defense against this.
     ransac_min_inliers: int = 15
-    # Physical plausibility bounds for tracking_method="sparse" -- a
+    # Physical plausibility bounds, shared by "sparse" and "learned" -- a
     # computed transform is rejected (treated as a tracking failure, not
     # published) if it implies an average speed/turn-rate above these,
     # given the REAL elapsed wall-clock time between the two frames (not
@@ -173,6 +194,16 @@ class DimSimVisualOdometryModule(Module):
         self._camera_info = make_camera_info_default()
         self._intrinsic = None  # built lazily in start() -- needs open3d import
         self._cv2 = None  # built lazily in start() -- needs cv2 import, see start()
+        # Learned-backend state (tracking_method="learned") -- torch,
+        # kornia, and the DISK/LightGlue models are all deferred-imported
+        # and built lazily on first use, same reasoning as self._cv2: pay
+        # the (much larger, here) import/model-download/device-transfer
+        # cost only when this tracking method is actually selected. See
+        # _ensure_learned_backend.
+        self._torch = None
+        self._learned_device = None
+        self._disk = None
+        self._lightglue = None
 
         self._latest_color: Image | None = None
         self._latest_depth: Image | None = None
@@ -222,9 +253,9 @@ class DimSimVisualOdometryModule(Module):
         self._vo_success_count = 0
         self._last_pairing_gap_s = 0.0
 
-        # Per-interval breakdown of WHY tracking_method="sparse" rejected
-        # a frame, reset every _DIVERGENCE_LOG_INTERVAL_S tick (see
-        # _maybe_log_divergence) -- useful for telling which specific
+        # Per-interval breakdown of WHY tracking_method="sparse"/"learned"
+        # rejected a frame, reset every _DIVERGENCE_LOG_INTERVAL_S tick
+        # (see _maybe_log_divergence) -- useful for telling which specific
         # check (too few matches, degenerate geometry, implausible speed)
         # is responsible for a low success rate, without needing to
         # enable full debug logging (too noisy at several frames/sec to
@@ -335,7 +366,7 @@ class DimSimVisualOdometryModule(Module):
         depth_np = depth.data  # raw uint16 mm -- deliberately NOT divided
                                 # by 1000 here, see module docstring note 3.
 
-        if self.config.tracking_method == "sparse":
+        if self.config.tracking_method in ("sparse", "learned"):
             depth_m = depth_np.astype(np.float32) / 1000.0
             if self._prev_color_np is None:
                 self._prev_color_np = color_np
@@ -343,7 +374,12 @@ class DimSimVisualOdometryModule(Module):
                 self._prev_color_ts = color.ts
                 return
             dt = max(color.ts - self._prev_color_ts, 1e-3)  # guard against zero/negative dt
-            success, trans = self._compute_transform_sparse(
+            compute_fn = (
+                self._compute_transform_sparse
+                if self.config.tracking_method == "sparse"
+                else self._compute_transform_learned
+            )
+            success, trans = compute_fn(
                 color_np, depth_m, self._prev_color_np, self._prev_depth_m, dt
             )
             self._prev_color_np = color_np
@@ -415,26 +451,48 @@ class DimSimVisualOdometryModule(Module):
         self._prev_rgbd = rgbd
         return success, trans
 
-    def _compute_transform_sparse(
+    def _reject(self, reason: str) -> tuple[bool, np.ndarray]:
+        self._reject_counts[reason] = self._reject_counts.get(reason, 0) + 1
+        return False, np.eye(4)
+
+    def _unproject_pixel(self, depth_img: np.ndarray, u: float, v: float):
+        """Pixel (u, v) + a depth image -> camera-frame 3D point, or None
+        if out of bounds / outside min_depth_m..max_depth_m. Shared by
+        _compute_transform_sparse and _compute_transform_learned -- both
+        feed depth-backed 2D keypoint matches through the same
+        unprojection math, only the keypoint SOURCE differs."""
+        ui, vi = int(round(u)), int(round(v))
+        if not (0 <= vi < depth_img.shape[0] and 0 <= ui < depth_img.shape[1]):
+            return None
+        d = float(depth_img[vi, ui])
+        if not np.isfinite(d) or d <= self.config.min_depth_m or d >= self.config.max_depth_m:
+            return None
+        fx, fy = self._camera_info.K[0], self._camera_info.K[4]
+        cx, cy = self._camera_info.K[2], self._camera_info.K[5]
+        return ((u - cx) / fx * d, (v - cy) / fy * d, d)
+
+    def _rigid_fit_from_correspondences(
         self,
-        color_np: np.ndarray,
-        depth_m: np.ndarray,
-        prev_color_np: np.ndarray,
-        prev_depth_m: np.ndarray,
+        pts_prev: list[tuple[float, float, float]],
+        pts_curr: list[tuple[float, float, float]],
         dt: float,
     ) -> tuple[bool, np.ndarray]:
-        """3D-3D rigid alignment via ORB feature matching + RANSAC,
-        tolerant of large/irregular inter-frame gaps unlike
-        _compute_transform_dense.
+        """3D-3D RANSAC + Kabsch/Umeyama rigid alignment given a list of
+        camera-frame 3D-3D point correspondences, plus the same
+        degenerate-geometry and physical-plausibility rejection layers --
+        the shared backend for both _compute_transform_sparse (ORB
+        correspondences) and _compute_transform_learned (DISK+LightGlue
+        correspondences). Neither front-end cares how correspondences were
+        found; this is pure geometry.
 
         Depth is available on BOTH frames (unlike a typical monocular VO
-        setup), so each matched 2D keypoint pair unprojects to a genuine
-        3D-3D correspondence -- not 2D-3D PnP. This makes the pose
-        estimate a rigid-body alignment problem (Kabsch/Umeyama), solvable
-        in closed form via SVD once outliers are rejected, rather than an
-        iterative reprojection-error minimization -- and gives real,
-        absolute-scale translation directly from the depth data, with no
-        brightness-constancy or small-angle-linearization assumption.
+        setup), so each correspondence is a genuine 3D-3D pair -- not 2D-3D
+        PnP. This makes the pose estimate a rigid-body alignment problem
+        (Kabsch/Umeyama), solvable in closed form via SVD once outliers
+        are rejected, rather than an iterative reprojection-error
+        minimization -- and gives real, absolute-scale translation
+        directly from the depth data, with no brightness-constancy or
+        small-angle-linearization assumption.
 
         cv2.estimateAffine3D provides the RANSAC-based outlier rejection
         (OpenCV's Python bindings don't expose a rigid-only 3D-3D RANSAC
@@ -446,74 +504,23 @@ class DimSimVisualOdometryModule(Module):
         relative motion between two metric-depth camera views is rigid by
         construction.
 
-        dt: real elapsed wall-clock time (seconds) between prev_color_np
-        and color_np's capture, used only for the physical-plausibility
-        check at the end (see max_linear_mps/max_angular_rps) -- not
-        assumed small.
+        dt: real elapsed wall-clock time (seconds) between the two frames,
+        used only for the physical-plausibility check at the end (see
+        max_linear_mps/max_angular_rps) -- not assumed small.
 
         Returns (success, trans) matching _compute_transform_dense's
         contract exactly (trans: motion FROM target(prev) TO
         source(current) in camera coordinates, ready to be
         right-multiplied into self._accumulated_transform)."""
-
-        def _reject(reason: str) -> tuple[bool, np.ndarray]:
-            self._reject_counts[reason] = self._reject_counts.get(reason, 0) + 1
-            return False, np.eye(4)
-
         if self._cv2 is None:
             import cv2  # deferred import, same reasoning as open3d in
-                        # start() -- only pay this cost when sparse
-                        # tracking is actually selected/used.
+                        # start() -- only pay this cost when a method that
+                        # needs it is actually selected/used.
             self._cv2 = cv2
         cv2 = self._cv2
 
-        prev_gray = cv2.cvtColor(prev_color_np, cv2.COLOR_RGB2GRAY)
-        curr_gray = cv2.cvtColor(color_np, cv2.COLOR_RGB2GRAY)
-
-        orb = cv2.ORB_create(nfeatures=self.config.orb_n_features)
-        kp1, des1 = orb.detectAndCompute(prev_gray, None)
-        kp2, des2 = orb.detectAndCompute(curr_gray, None)
-        if (
-            des1 is None
-            or des2 is None
-            or len(kp1) < self.config.ransac_min_inliers
-            or len(kp2) < self.config.ransac_min_inliers
-        ):
-            return _reject("too_few_orb_features")
-
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING)
-        knn_matches = bf.knnMatch(des1, des2, k=2)
-        good = [
-            m for m, n in (pair for pair in knn_matches if len(pair) == 2)
-            if m.distance < self.config.orb_ratio_test_threshold * n.distance
-        ]
-        if len(good) < self.config.ransac_min_inliers:
-            return _reject("too_few_orb_matches")
-
-        fx, fy = self._camera_info.K[0], self._camera_info.K[4]
-        cx, cy = self._camera_info.K[2], self._camera_info.K[5]
-        min_d, max_d = self.config.min_depth_m, self.config.max_depth_m
-
-        def unproject(depth_img: np.ndarray, u: float, v: float):
-            ui, vi = int(round(u)), int(round(v))
-            if not (0 <= vi < depth_img.shape[0] and 0 <= ui < depth_img.shape[1]):
-                return None
-            d = float(depth_img[vi, ui])
-            if not np.isfinite(d) or d <= min_d or d >= max_d:
-                return None
-            return ((u - cx) / fx * d, (v - cy) / fy * d, d)
-
-        pts_prev, pts_curr = [], []
-        for m in good:
-            p1 = unproject(prev_depth_m, *kp1[m.queryIdx].pt)
-            p2 = unproject(depth_m, *kp2[m.trainIdx].pt)
-            if p1 is None or p2 is None:
-                continue
-            pts_prev.append(p1)
-            pts_curr.append(p2)
-
         if len(pts_prev) < self.config.ransac_min_inliers:
-            return _reject("too_few_unprojectable_matches")
+            return self._reject("too_few_unprojectable_matches")
 
         pts_prev_arr = np.array(pts_prev, dtype=np.float64)
         pts_curr_arr = np.array(pts_curr, dtype=np.float64)
@@ -524,10 +531,10 @@ class DimSimVisualOdometryModule(Module):
             confidence=0.99,
         )
         if not retval or inliers is None:
-            return _reject("ransac_failed")
+            return self._reject("ransac_failed")
         inlier_mask = inliers.ravel().astype(bool)
         if int(inlier_mask.sum()) < self.config.ransac_min_inliers:
-            return _reject("too_few_ransac_inliers")
+            return self._reject("too_few_ransac_inliers")
 
         # Kabsch/Umeyama closed-form rigid alignment on the RANSAC inlier
         # set: find R, t minimizing sum ||dst_i - (R @ src_i + t)||^2.
@@ -549,14 +556,14 @@ class DimSimVisualOdometryModule(Module):
         spread = np.linalg.svd(src_c, compute_uv=False)
         if spread[0] < 1e-9 or (spread[-1] / spread[0]) < self.config.min_point_spread_ratio:
             logger.debug(
-                "DimSimVisualOdometryModule: sparse transform rejected -- "
+                "DimSimVisualOdometryModule: transform rejected -- "
                 "matched points are too close to planar/collinear "
                 "(singular value ratio %.4f, need >=%.4f) for a "
                 "well-conditioned rigid fit -- likely facing a flat "
                 "surface head-on",
                 spread[-1] / max(spread[0], 1e-9), self.config.min_point_spread_ratio,
             )
-            return _reject("degenerate_geometry")
+            return self._reject("degenerate_geometry")
 
         H = src_c.T @ dst_c
         U, _, Vt = np.linalg.svd(H)
@@ -585,15 +592,162 @@ class DimSimVisualOdometryModule(Module):
         rate_rps = angle_rad / dt
         if speed_mps > self.config.max_linear_mps or rate_rps > self.config.max_angular_rps:
             logger.debug(
-                "DimSimVisualOdometryModule: sparse transform rejected as "
+                "DimSimVisualOdometryModule: transform rejected as "
                 "physically implausible (%.2fm/s, %.2frad/s over dt=%.3fs) -- "
                 "likely a wrong RANSAC consensus on ambiguous/repetitive "
                 "scene structure, not a real motion",
                 speed_mps, rate_rps, dt,
             )
-            return _reject("implausible_speed")
+            return self._reject("implausible_speed")
 
         return True, trans
+
+    def _compute_transform_sparse(
+        self,
+        color_np: np.ndarray,
+        depth_m: np.ndarray,
+        prev_color_np: np.ndarray,
+        prev_depth_m: np.ndarray,
+        dt: float,
+    ) -> tuple[bool, np.ndarray]:
+        """ORB feature matching + brute-force Hamming matching to find
+        correspondences, then _rigid_fit_from_correspondences for the
+        actual pose estimate. Tolerant of large/irregular inter-frame gaps
+        unlike _compute_transform_dense, since it doesn't depend on a
+        small-motion assumption at all."""
+        if self._cv2 is None:
+            import cv2  # deferred import, same reasoning as open3d in
+                        # start() -- only pay this cost when sparse
+                        # tracking is actually selected/used.
+            self._cv2 = cv2
+        cv2 = self._cv2
+
+        prev_gray = cv2.cvtColor(prev_color_np, cv2.COLOR_RGB2GRAY)
+        curr_gray = cv2.cvtColor(color_np, cv2.COLOR_RGB2GRAY)
+
+        orb = cv2.ORB_create(nfeatures=self.config.orb_n_features)
+        kp1, des1 = orb.detectAndCompute(prev_gray, None)
+        kp2, des2 = orb.detectAndCompute(curr_gray, None)
+        if (
+            des1 is None
+            or des2 is None
+            or len(kp1) < self.config.ransac_min_inliers
+            or len(kp2) < self.config.ransac_min_inliers
+        ):
+            return self._reject("too_few_orb_features")
+
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+        knn_matches = bf.knnMatch(des1, des2, k=2)
+        good = [
+            m for m, n in (pair for pair in knn_matches if len(pair) == 2)
+            if m.distance < self.config.orb_ratio_test_threshold * n.distance
+        ]
+        if len(good) < self.config.ransac_min_inliers:
+            return self._reject("too_few_orb_matches")
+
+        pts_prev, pts_curr = [], []
+        for m in good:
+            p1 = self._unproject_pixel(prev_depth_m, *kp1[m.queryIdx].pt)
+            p2 = self._unproject_pixel(depth_m, *kp2[m.trainIdx].pt)
+            if p1 is None or p2 is None:
+                continue
+            pts_prev.append(p1)
+            pts_curr.append(p2)
+
+        return self._rigid_fit_from_correspondences(pts_prev, pts_curr, dt)
+
+    def _ensure_learned_backend(self):
+        """Deferred-imports torch/kornia and loads DISK + LightGlue onto
+        whichever device is available, caching everything on self. Only
+        called when tracking_method="learned" is actually selected, same
+        reasoning as self._cv2's deferred import -- these are meaningfully
+        heavier than cv2 (real model weights, a real device transfer)."""
+        if self._torch is not None:
+            return
+        import torch  # deferred, see docstring above
+        import kornia.feature as KF
+
+        self._torch = torch
+        self._learned_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self._learned_device.type == "cpu":
+            logger.warning(
+                "DimSimVisualOdometryModule: tracking_method='learned' running "
+                "on CPU (no CUDA device found) -- expect roughly 1s per frame "
+                "pair, far too slow for real-time tracking. Only useful here "
+                "for correctness testing without a GPU."
+            )
+        self._disk = KF.DISK.from_pretrained("depth", device=self._learned_device).eval()
+        self._lightglue = KF.LightGlue(features="disk").to(self._learned_device).eval()
+        logger.info(
+            "DimSimVisualOdometryModule: learned backend (DISK+LightGlue) "
+            "loaded on %s", self._learned_device,
+        )
+
+    def _compute_transform_learned(
+        self,
+        color_np: np.ndarray,
+        depth_m: np.ndarray,
+        prev_color_np: np.ndarray,
+        prev_depth_m: np.ndarray,
+        dt: float,
+    ) -> tuple[bool, np.ndarray]:
+        """DISK keypoints + LightGlue matching to find correspondences,
+        then _rigid_fit_from_correspondences for the actual pose estimate
+        -- same backend as _compute_transform_sparse, only the front-end
+        feature detector/matcher differs. DISK+LightGlue are learned (not
+        hand-crafted) and are typically far more robust than ORB at
+        finding correct correspondences in low-texture/repetitive scenes,
+        the dominant failure mode observed for tracking_method="sparse"
+        against DimSim's actual rendered content (see module docstring)."""
+        self._ensure_learned_backend()
+        torch = self._torch
+        device = self._learned_device
+
+        def to_tensor(img: np.ndarray):
+            return torch.from_numpy(np.ascontiguousarray(img)).float().permute(2, 0, 1)[None].to(device) / 255.0
+
+        h, w = color_np.shape[:2]
+        with torch.inference_mode():
+            feats = self._disk(
+                torch.cat([to_tensor(prev_color_np), to_tensor(color_np)], dim=0),
+                n=self.config.learned_max_keypoints,
+                pad_if_not_divisible=True,
+            )
+            f_prev, f_curr = feats[0], feats[1]
+            if f_prev.keypoints.shape[0] < self.config.ransac_min_inliers or \
+                    f_curr.keypoints.shape[0] < self.config.ransac_min_inliers:
+                return self._reject("too_few_learned_keypoints")
+
+            match_out = self._lightglue({
+                "image0": {
+                    "keypoints": f_prev.keypoints[None],
+                    "descriptors": f_prev.descriptors[None],
+                    "image_size": torch.tensor([[w, h]], device=device),
+                },
+                "image1": {
+                    "keypoints": f_curr.keypoints[None],
+                    "descriptors": f_curr.descriptors[None],
+                    "image_size": torch.tensor([[w, h]], device=device),
+                },
+            })
+            matches = match_out["matches"][0].cpu().numpy()
+
+        if len(matches) < self.config.ransac_min_inliers:
+            return self._reject("too_few_learned_matches")
+
+        kp_prev = f_prev.keypoints.cpu().numpy()
+        kp_curr = f_curr.keypoints.cpu().numpy()
+
+        pts_prev, pts_curr = [], []
+        for i_prev, i_curr in matches:
+            p1 = self._unproject_pixel(prev_depth_m, *kp_prev[i_prev])
+            p2 = self._unproject_pixel(depth_m, *kp_curr[i_curr])
+            if p1 is None or p2 is None:
+                continue
+            pts_prev.append(p1)
+            pts_curr.append(p2)
+
+        return self._rigid_fit_from_correspondences(pts_prev, pts_curr, dt)
 
     def _camera_to_world_pose(self, transform: np.ndarray, ts: float) -> PoseStamped:
         """Convert an accumulated Open3D camera-frame 4x4 transform into a

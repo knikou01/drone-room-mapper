@@ -187,6 +187,18 @@ accuracy improves, not as a working alternative today.
     (`too_few_orb_features`/`too_few_orb_matches`/`degenerate_geometry`
     dominating, not just the safety filters). This is a content/rendering
     characteristic of the simulated scenes, not a tuning problem alone.
+  - **A third tracking method, `tracking_method="learned"`, is now
+    available** (DISK keypoints + LightGlue matching instead of ORB,
+    feeding the same 3D-3D RANSAC/Kabsch backend as `"sparse"` — see
+    `drone/dimsim_visual_odometry_module.py`'s module docstring). Learned
+    features are typically far more robust than ORB's hand-crafted ones on
+    low-texture/repetitive scenes — the specific failure mode above — but
+    this is unvalidated against DimSim's actual scene content so far, only
+    against synthetic fixtures (`tests/test_vo_learned_tracking.py`).
+    Meaningfully more expensive per frame than ORB and runs on CUDA
+    automatically if available, CPU otherwise; on CPU it's roughly 1s per
+    frame pair, far too slow for real-time use, so a live test of this
+    tracking method needs a GPU. Not the default — opt in explicitly.
   - **Decision: decouple navigation from mapping rather than swap both
     onto VO together.** A live test with both remapped produced
     a visibly corrupted map ("walls where they don't belong") — mapping
@@ -221,7 +233,8 @@ accuracy improves, not as a working alternative today.
     residual frame-rate variability further (a real, separate lever that
     was flagged but not fully pursued — see `_dimosCaptureRgb`'s
     JPEG-encode cost, still untouched). Revisit VO-driven navigation as a
-    default only if either of those change the picture.
+    default only if `tracking_method="learned"`'s real-world success rate
+    (once tested on a GPU) or either of those change the picture.
 - **A glass surface in the `apt` scene permanently wedges the robot on
   contact.** This is a general limitation of robots running DimOS against
   DimSim's thin/transparent-surface collision handling, not something

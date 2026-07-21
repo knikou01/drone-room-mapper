@@ -5,15 +5,9 @@ description = "Simulation tool for drone with DimOS mapping a room"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    # Pointed at the user's fork (2026-07-15), branch
-    # drone-room-mapper/silent-stop-v5 -- carries MovementManager.
-    # silent_stop (needed by AgenticFrontierSelector's safety monitor, see
-    # that file's docstring) on top of the fork's main, which the user
-    # synced with upstream via GitHub's PR-based conflict resolution
-    # (earlier attempts -- v2/v3/v4 -- hit a stale-fork packaging gap or a
-    # Git LFS credentials wall building fresh off upstream directly; see
-    # the dimos-dependency-wiring memory for the full history if this ever
-    # needs redoing).
+    # Pointed at a fork, branch drone-room-mapper/silent-stop-v5 -- carries
+    # MovementManager.silent_stop (needed by AgenticFrontierSelector's
+    # safety monitor, see that file's docstring) on top of upstream dimos.
     "dimos[base,drone] @ git+https://github.com/knikou01/dimos.git@drone-room-mapper/silent-stop-v5",
     # agentic explorer
     "Pillow",           # costmap image rendering in AgenticFrontierSelector
@@ -23,32 +17,31 @@ dependencies = [
     "pybullet",         # PyBullet room rendering and depth capture
     # real drone depth mapping (DroneDepthModule)
     "transformers",     # Depth Anything V2 inference pipeline
-    "torch",            # CPU-only, required by transformers depth models
-    # Explicit now (2026-07-15): confirmed missing/import-erroring live
-    # even with the plain upstream dimos pin above -- a pre-existing gap
-    # between what dimos[base,drone] declares and what it actually needs
-    # at import time (python-socketio in particular: needed by
+    # torch auto-selects CUDA if a compatible GPU/driver is present at
+    # runtime, CPU otherwise -- no separate CPU/GPU package variant needed.
+    # Used by transformers' depth models and by kornia (DISK+LightGlue,
+    # DimSimVisualOdometryModule's tracking_method="learned").
+    "torch",
+    "kornia",  # DISK + LightGlue (drone/dimsim_visual_odometry_module.py's tracking_method="learned")
+    # A pre-existing gap between what dimos[base,drone] declares and what
+    # it actually needs at import time: python-socketio is needed by
     # dimos.web.websocket_vis.websocket_vis_module, imported by
     # dimos.visualization.vis_module, which EVERY blueprint in this repo
-    # uses -- nothing to do with the fork detour above). langchain-groq
-    # (+ groq, its own dependency) is what McpClient's model="groq:..."
-    # provider prefix actually resolves through (langchain.agents.
-    # create_agent's universal init_chat_model-style provider dispatch,
-    # dimos/agents/mcp/mcp_client.py) -- needed for the console's Groq
-    # option, not just our own AgenticFrontierSelector Groq client (which
-    # uses the openai package directly, unaffected). pytest is needed for
-    # tests/.
+    # uses. langchain-groq (+ groq, its own dependency) is what
+    # McpClient's model="groq:..." provider prefix actually resolves
+    # through (langchain.agents.create_agent's universal
+    # init_chat_model-style provider dispatch, dimos/agents/mcp/mcp_client.py)
+    # -- needed for the console's Groq option, not just
+    # AgenticFrontierSelector's own Groq client (which uses the openai
+    # package directly, unaffected). pytest is needed for tests/.
     "pytest",
     "groq",
     "langchain-groq",
     "opencv-contrib-python",  # cv2, used directly in sim_camera/tests
     "langchain-google-genai", # used directly in blueprints/sim_agentic_blueprint.py
     "python-socketio",  # dimos.web.websocket_vis.websocket_vis_module (vis_module, used by every blueprint)
-    # Confirmed missing live (2026-07-15), same pre-existing-gap pattern as
-    # the block above -- this one only surfaces at WebInput.start() (a
-    # FastAPI route decorator needs it to register a form-data endpoint),
-    # not at import time, so the earlier "import every blueprint" sweep
-    # didn't catch it.
+    # Only surfaces at WebInput.start() (a FastAPI route decorator needs it
+    # to register a form-data endpoint), not at import time.
     "python-multipart",  # dimos.web.dimos_interface.api.server's /submit_query route (via WebInput)
 ]
 

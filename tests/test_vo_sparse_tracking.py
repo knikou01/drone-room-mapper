@@ -4,49 +4,33 @@ compute_rgbd_odometry -- see that module's docstring for why: dense
 odometry assumes small inter-frame motion, and DimSim's observed
 color/depth pairing_gap regularly breaks that assumption).
 
-Two synthetic scene builders, both warped by the homography a known rigid
-camera motion induces and with a correctly-derived per-pixel depth map for
-the "current" frame (NOT simply reusing the previous frame's depth -- a
-plane at a fixed depth in the PREVIOUS camera's frame is at a genuinely
-different depth from the CURRENT camera's viewpoint once it has moved; an
-incorrect depth model biases the recovered translation scale specifically,
-without visibly harming rotation accuracy, so it's easy to miss):
-
-1. make_corner_frame_pair: a two-plane "room corner" (left half of the
-   image at one depth, right half at another) -- genuine 3D structure
-   (variance along all three axes, not just the two in-image ones), used
-   for the "should succeed accurately" cases.
-
-2. make_plane_frame_pair: a SINGLE fronto-parallel plane -- genuinely
-   planar data (near-zero variance along the camera's depth axis
-   specifically), used to test min_point_spread_ratio's rejection of
-   degenerate geometry. IMPORTANT: a flat plane is degenerate for this
-   check REGARDLESS of its orientation/tilt relative to the camera -- SVD
-   of the point cloud's own coordinates is orientation-invariant, a plane
-   only ever spans a 2D subspace no matter how it's angled. Also useful
-   for the "not enough overlapping texture at extreme rotation" case
-   below, since a single plane is an artificially hard case for large
-   rotations specifically (almost all "current frame" pixels beyond a
-   modest angle map outside the original plane's warped bounds) -- a real
-   room has texture at many depths/orientations simultaneously, which
-   should provide meaningfully more surviving correspondences at the same
-   rotation angle than either synthetic scene here. These tests confirm
-   the algorithm is mathematically/numerically CORRECT when given
-   well-conditioned data, and that it fails SAFELY (not silently-wrong)
-   when the data is degenerate or insufficient -- they cannot by
-   themselves confirm real DimSim scenes will provide enough of either at
-   the gaps observed in practice. That needs a real
-   run_sim_dimsim_vo_only.py live test, not these synthetic ones.
+Uses the synthetic frame-pair builders in _vo_synthetic_scenes.py (shared
+with test_vo_learned_tracking.py, since both exercise the same downstream
+3D-3D RANSAC/Kabsch backend with different feature front-ends -- see that
+file's docstring for what each builder represents). A single plane is also
+useful here for the "not enough overlapping texture at extreme rotation"
+case below, since it's an artificially hard case for large rotations
+specifically (almost all "current frame" pixels beyond a modest angle map
+outside the original plane's warped bounds) -- a real room has texture at
+many depths/orientations simultaneously, which should provide meaningfully
+more surviving correspondences at the same rotation angle. These tests
+confirm the algorithm is mathematically/numerically CORRECT when given
+well-conditioned data, and that it fails SAFELY (not silently-wrong) when
+the data is degenerate or insufficient -- they cannot by themselves
+confirm real DimSim scenes will provide enough of either at the gaps
+observed in practice. That needs a real run_sim_dimsim_vo_only.py live
+test, not these synthetic ones.
 """
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import cv2
 import numpy as np
 
 from drone.dimsim_visual_odometry_module import DimSimVisualOdometryModule
+from _vo_synthetic_scenes import make_corner_frame_pair, make_plane_frame_pair
 
 failures = []
 
@@ -56,109 +40,6 @@ def check(name, cond):
     print(f"[{status}] {name}")
     if not cond:
         failures.append(name)
-
-
-def rot_matrix(rx, ry, rz):
-    cxr, sxr = np.cos(rx), np.sin(rx)
-    cyr, syr = np.cos(ry), np.sin(ry)
-    czr, szr = np.cos(rz), np.sin(rz)
-    Rx = np.array([[1, 0, 0], [0, cxr, -sxr], [0, sxr, cxr]])
-    Ry = np.array([[cyr, 0, syr], [0, 1, 0], [-syr, 0, cyr]])
-    Rz = np.array([[czr, -szr, 0], [szr, czr, 0], [0, 0, 1]])
-    return Rz @ Ry @ Rx
-
-
-def _plane_warp(fx, fy, cx, cy, w, h, Z0, R_true, t_true):
-    """Homography + correct per-pixel current-frame depth for a single
-    fronto-parallel plane at depth Z0 (previous camera's frame), for the
-    given rigid motion (point-transform convention X2 = R X1 + t, matching
-    _compute_transform_sparse's own contract). Returns (H, depth_curr_fn)
-    where depth_curr_fn(output_mask_shape) computes the current-frame
-    depth map for that plane region."""
-    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-    n = np.array([0, 0, 1.0])
-    H = K @ (R_true + np.outer(t_true, n) / Z0) @ np.linalg.inv(K)
-    H = H / H[2, 2]
-
-    Hinv = np.linalg.inv(H)
-    us, vs = np.meshgrid(np.arange(w), np.arange(h))
-    ones = np.ones_like(us, dtype=np.float64)
-    pix_curr = np.stack([us, vs, ones], axis=-1).astype(np.float64)
-    pix_prev_h = pix_curr @ Hinv.T
-    pix_prev = pix_prev_h[..., :2] / pix_prev_h[..., 2:3]
-    u_prev, v_prev = pix_prev[..., 0], pix_prev[..., 1]
-
-    X_prev = (u_prev - cx) / fx * Z0
-    Y_prev = (v_prev - cy) / fy * Z0
-    Z_prev = np.full_like(X_prev, Z0)
-    p_prev = np.stack([X_prev, Y_prev, Z_prev], axis=-1)
-    p_curr = p_prev @ R_true.T + t_true
-    curr_depth_m = p_curr[..., 2].astype(np.float32)
-
-    valid = (u_prev >= 0) & (u_prev < w) & (v_prev >= 0) & (v_prev < h)
-    curr_depth_m[~valid] = 0.0
-    return H, curr_depth_m
-
-
-def make_plane_frame_pair(mod, rot_rad_xyz, t_true, Z0=3.0, seed=1):
-    """Single fronto-parallel plane -- see module docstring: genuinely
-    planar/degenerate by construction, any orientation."""
-    fx, fy = mod._camera_info.K[0], mod._camera_info.K[4]
-    cx, cy = mod._camera_info.K[2], mod._camera_info.K[5]
-    w, h = mod._camera_info.width, mod._camera_info.height
-
-    rng = np.random.default_rng(seed)
-    prev_color = rng.integers(0, 255, size=(h, w, 3), dtype=np.uint8)
-    prev_depth_m = np.full((h, w), Z0, dtype=np.float32)
-
-    R_true = rot_matrix(*rot_rad_xyz)
-    t_true = np.array(t_true, dtype=np.float64)
-
-    H, curr_depth_m = _plane_warp(fx, fy, cx, cy, w, h, Z0, R_true, t_true)
-    curr_color = cv2.warpPerspective(prev_color, H, (w, h))
-
-    return curr_color, curr_depth_m, prev_color, prev_depth_m, R_true, t_true
-
-
-def make_corner_frame_pair(mod, rot_rad_xyz, t_true, Za=2.0, Zb=4.0, seed=1):
-    """Two fronto-parallel planes at DIFFERENT depths (left half of the
-    image at Za, right half at Zb) -- a "room corner"-like scene with
-    genuine variance along the camera's depth axis, not just the two
-    in-image ones. Well-conditioned for min_point_spread_ratio, unlike
-    make_plane_frame_pair's single plane."""
-    fx, fy = mod._camera_info.K[0], mod._camera_info.K[4]
-    cx, cy = mod._camera_info.K[2], mod._camera_info.K[5]
-    w, h = mod._camera_info.width, mod._camera_info.height
-    half = w // 2
-
-    rng = np.random.default_rng(seed)
-    prev_color = rng.integers(0, 255, size=(h, w, 3), dtype=np.uint8)
-    prev_depth_m = np.empty((h, w), dtype=np.float32)
-    prev_depth_m[:, :half] = Za
-    prev_depth_m[:, half:] = Zb
-
-    R_true = rot_matrix(*rot_rad_xyz)
-    t_true = np.array(t_true, dtype=np.float64)
-
-    Ha, depth_a = _plane_warp(fx, fy, cx, cy, w, h, Za, R_true, t_true)
-    Hb, depth_b = _plane_warp(fx, fy, cx, cy, w, h, Zb, R_true, t_true)
-    warped_a = cv2.warpPerspective(prev_color, Ha, (w, h))
-    warped_b = cv2.warpPerspective(prev_color, Hb, (w, h))
-
-    # Each output pixel's TRUE source region depends on which plane it
-    # maps back to under the correct (region-specific) homography -- use
-    # whichever warp lands its source pixel inside the region it actually
-    # belongs to (left half -> Za's plane, right half -> Zb's plane).
-    # Since both planes share the same previous-frame texture, blend by
-    # simply taking each output pixel from whichever warp corresponds to
-    # a source pixel within [0, half) vs [half, w) matching that warp's
-    # own depth assignment.
-    curr_color = np.where(
-        (np.arange(w)[None, :, None] < half), warped_a, warped_b
-    ).astype(np.uint8)
-    curr_depth_m = np.where(np.arange(w)[None, :] < half, depth_a, depth_b).astype(np.float32)
-
-    return curr_color, curr_depth_m, prev_color, prev_depth_m, R_true, t_true
 
 
 mod = DimSimVisualOdometryModule()
