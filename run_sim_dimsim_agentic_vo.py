@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Entry point for DimSim visual-SLAM + agentic console, PHASE 3:
-NAVIGATION driven by real VO (odom_vo). Mapping deliberately stays on
-ground truth -- see blueprints/sim_dimsim_agentic_vo_blueprint.py's module
-docstring SCOPE CHANGE section (a live test with mapping also on VO
-produced a visibly corrupted map, since mapping has no self-correction
-against VO drift the way replanning does).
+"""Entry point for DimSim visual-SLAM + agentic console, with NAVIGATION
+driven by real VO (odom_vo). Mapping deliberately stays on ground truth --
+see blueprints/sim_dimsim_agentic_vo_blueprint.py's module docstring
+(remapping mapping to VO too produces a visibly corrupted map, since
+mapping has no self-correction against VO drift the way replanning does).
 
 Mirrors run_sim_dimsim_agentic.py exactly (same provider-choice/safety-
 monitor-choice menu, reused directly rather than duplicated).
@@ -59,7 +58,7 @@ if __name__ == "__main__":
         coordinator.stop()
         exit(1)
 
-    print(f"DimSim Phase 3 agentic (VO-driven navigation, ground-truth mapping) started with {coordinator.n_modules} modules.")
+    print(f"DimSim agentic (VO-driven navigation, ground-truth mapping) started with {coordinator.n_modules} modules.")
     print("Open http://localhost:5555 for the natural-language console.")
     print("Type something like 'start exploring' to begin.")
     print("Ctrl+C to stop.")

@@ -1,19 +1,16 @@
-"""Verify DimSimVisualOdometryModule._compute_transform_sparse (Phase 3's
-ORB + depth-based 3D-3D RANSAC tracking, added 2026-07-20 to replace dense
-frame-to-frame compute_rgbd_odometry -- see that module's docstring for
-why: dense odometry assumes small inter-frame motion, and DimSim's
-observed pairing_gap (1000-1200ms documented baseline, up to 60000ms once
-under heavy system load) regularly breaks that assumption).
+"""Verify DimSimVisualOdometryModule._compute_transform_sparse (ORB +
+depth-based 3D-3D RANSAC tracking, used instead of dense frame-to-frame
+compute_rgbd_odometry -- see that module's docstring for why: dense
+odometry assumes small inter-frame motion, and DimSim's observed
+color/depth pairing_gap regularly breaks that assumption).
 
 Two synthetic scene builders, both warped by the homography a known rigid
 camera motion induces and with a correctly-derived per-pixel depth map for
 the "current" frame (NOT simply reusing the previous frame's depth -- a
 plane at a fixed depth in the PREVIOUS camera's frame is at a genuinely
-different depth from the CURRENT camera's viewpoint once it has moved.
-Getting this wrong produced deceptive results while first writing this
-test: rotation recovered near-perfectly while translation was off by ~1m,
-because an incorrect depth model biases the recovered translation scale
-specifically -- worth remembering if this test ever needs modifying):
+different depth from the CURRENT camera's viewpoint once it has moved; an
+incorrect depth model biases the recovered translation scale specifically,
+without visibly harming rotation accuracy, so it's easy to miss):
 
 1. make_corner_frame_pair: a two-plane "room corner" (left half of the
    image at one depth, right half at another) -- genuine 3D structure
@@ -23,27 +20,23 @@ specifically -- worth remembering if this test ever needs modifying):
 2. make_plane_frame_pair: a SINGLE fronto-parallel plane -- genuinely
    planar data (near-zero variance along the camera's depth axis
    specifically), used to test min_point_spread_ratio's rejection of
-   degenerate geometry (2026-07-20 addition -- see that config field's
-   docstring for the live-run evidence this fix is based on: facing a
-   flat wall head-on produced a small, "plausible-looking" but WRONG
-   transform that earlier checks couldn't catch). IMPORTANT: a flat
-   plane is degenerate for this check REGARDLESS of its orientation/tilt
-   relative to the camera -- SVD of the point cloud's own coordinates is
-   orientation-invariant, a plane only ever spans a 2D subspace no matter
-   how it's angled. Also still useful for the "not enough overlapping
-   texture at extreme rotation" case below, since a single plane is an
-   artificially hard case for large rotations specifically (almost all
-   "current frame" pixels beyond a modest angle map outside the original
-   plane's warped bounds) -- a real room has texture at many
-   depths/orientations simultaneously, which should provide meaningfully
-   more surviving correspondences at the same rotation angle than either
-   synthetic scene here. These tests confirm the algorithm is
-   mathematically/numerically CORRECT when given well-conditioned data,
-   and that it fails SAFELY (not silently-wrong) when the data is
-   degenerate or insufficient -- they cannot by themselves confirm real
-   DimSim scenes will provide enough of either at the gaps actually
-   observed live. That's Gate 1's job (a real run_sim_dimsim_vo_only.py
-   live test), not these synthetic ones.
+   degenerate geometry. IMPORTANT: a flat plane is degenerate for this
+   check REGARDLESS of its orientation/tilt relative to the camera -- SVD
+   of the point cloud's own coordinates is orientation-invariant, a plane
+   only ever spans a 2D subspace no matter how it's angled. Also useful
+   for the "not enough overlapping texture at extreme rotation" case
+   below, since a single plane is an artificially hard case for large
+   rotations specifically (almost all "current frame" pixels beyond a
+   modest angle map outside the original plane's warped bounds) -- a real
+   room has texture at many depths/orientations simultaneously, which
+   should provide meaningfully more surviving correspondences at the same
+   rotation angle than either synthetic scene here. These tests confirm
+   the algorithm is mathematically/numerically CORRECT when given
+   well-conditioned data, and that it fails SAFELY (not silently-wrong)
+   when the data is degenerate or insufficient -- they cannot by
+   themselves confirm real DimSim scenes will provide enough of either at
+   the gaps observed in practice. That needs a real
+   run_sim_dimsim_vo_only.py live test, not these synthetic ones.
 """
 import sys
 from pathlib import Path
@@ -184,18 +177,14 @@ if success:
     check(f"modest motion: rotation recovered accurately (max abs err={r_err:.4f})", r_err < 0.01)
     check(f"modest motion: translation recovered accurately (max abs err={t_err:.4f}m)", t_err < 0.01)
 
-# --- Larger, non-trivial rotation (still well short of the ~50-60deg
-# region where a two-region synthetic scene like this one starts running
-# out of reliably-shared texture between regions -- confirmed by direct
-# experimentation while writing this test: some seed/angle combinations in
-# that harder range produced RANSAC "inlier" sets that were numerically
-# non-degenerate by the spread check but still geometrically unstable
-# (large errors even though min_point_spread_ratio didn't reject them) --
-# a real, separate limitation of THIS simple two-plane synthetic
-# construction specifically, not something this test tries to paper over
-# by cherry-picking; 10deg/seed=4 is a configuration confirmed to produce
-# well-distributed cross-region matches) still recovers correctly when
-# there's still meaningful, well-conditioned overlap. ---
+# --- Larger, non-trivial rotation still recovers correctly when there's
+# still meaningful, well-conditioned overlap. Kept well short of the
+# ~50-60deg region where this two-region synthetic scene starts running
+# out of reliably-shared texture between regions -- past that point some
+# seed/angle combinations produce RANSAC "inlier" sets that are
+# numerically non-degenerate by the spread check but still geometrically
+# unstable, a limitation of this simple two-plane construction, not of the
+# tracking algorithm itself. ---
 curr_color, curr_depth_m, prev_color, prev_depth_m, R_true, t_true = make_corner_frame_pair(
     mod, (0.0, np.radians(10), 0.0), [0.3, 0.0, 0.0], seed=4
 )
@@ -219,16 +208,12 @@ curr_color, curr_depth_m, prev_color, prev_depth_m, R_true, t_true = make_plane_
 success, _trans = mod._compute_transform_sparse(curr_color, curr_depth_m, prev_color, prev_depth_m, 1.0)
 check("extreme single-plane rotation (69deg): fails safely (no false-success)", not success)
 
-# --- Degenerate (near-planar) geometry rejection (2026-07-20 addition,
-# added after a live run showed a small, "plausible-looking" but WRONG
-# transform published while the robot faced a flat wall head-on -- raw
-# "not enough matching points" warnings from cv2.estimateAffine3D's own
-# internals coincided with VO reporting 0.128m/3.4deg while the robot had
-# actually moved 2.096m/61.2deg). Same modest-motion parameters that
-# succeed cleanly against the corner scene above should be REJECTED
-# against a single (degenerate) plane, regardless of how modest/accurate
-# the underlying motion is -- this confirms min_point_spread_ratio is
-# doing real work, not just coincidentally never triggering. ---
+# --- Degenerate (near-planar) geometry rejection: the same modest-motion
+# parameters that succeed cleanly against the corner scene above should be
+# REJECTED against a single (degenerate) plane, regardless of how
+# modest/accurate the underlying motion is -- this confirms
+# min_point_spread_ratio is doing real work, not just coincidentally never
+# triggering. ---
 curr_color, curr_depth_m, prev_color, prev_depth_m, R_true, t_true = make_plane_frame_pair(
     mod, (0.03, 0.08, -0.02), [0.5, -0.1, 0.2], seed=7
 )
@@ -250,12 +235,11 @@ try:
 except Exception as e:  # noqa: BLE001 -- deliberately broad, this check is "did it crash at all"
     check(f"blank/degenerate frames: fails safely, no crash (raised {e!r})", False)
 
-# --- Physical-plausibility rejection (2026-07-20 addition, added after a
-# live run showed RANSAC converging on a plausible-looking but wrong
-# consensus against a real room's repetitive geometry -- e.g. one interval
-# reported 5.15x the true displacement). A geometrically-correct transform
+# --- Physical-plausibility rejection: a geometrically-correct transform
 # fed an implausibly short dt implies an impossible speed and must be
-# rejected regardless of how clean the underlying match was. ---
+# rejected regardless of how clean the underlying match was -- guards
+# against RANSAC converging on a plausible-looking but wrong consensus
+# against a real room's repetitive geometry. ---
 curr_color, curr_depth_m, prev_color, prev_depth_m, R_true, t_true = make_corner_frame_pair(
     mod, (0.03, 0.08, -0.02), [0.5, -0.1, 0.2], seed=7
 )

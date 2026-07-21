@@ -1,24 +1,22 @@
-"""DimSim visual-SLAM + agentic console blueprint -- PHASE 3: NAVIGATION
-pose driven by real VO (odom_vo). Mapping deliberately stays on ground
-truth -- see SCOPE CHANGE below.
+"""DimSim visual-SLAM + agentic console blueprint -- NAVIGATION pose
+driven by real VO (odom_vo). Mapping deliberately stays on ground truth --
+see the scope note below.
 
 Near-identical to sim_dimsim_agentic_blueprint.py (see that file's
-docstring for the full agentic-console history/reasoning, unchanged here)
--- this is the agentic-console equivalent of sim_dimsim_vo_nav_blueprint.py
-(Phase 3's plain-navigation equivalent, see that file's docstring for the
-full SCOPE CHANGE reasoning this mirrors), added as a NEW, separate
-blueprint rather than editing the ground-truth-pose one in place, so that
-variant stays available for comparison/fallback.
+docstring for the full agentic-console reasoning, unchanged here) -- this
+is the agentic-console equivalent of sim_dimsim_vo_nav_blueprint.py (see
+that file's docstring for the full mapping-vs-navigation reasoning this
+mirrors), added as a NEW, separate blueprint rather than editing the
+ground-truth-pose one in place, so that variant stays available for
+comparison/fallback.
 
-SCOPE CHANGE (2026-07-20), after live testing: originally remapped ALL
-THREE real pose-consumers (AgenticFrontierSelector, ReplanningAStarPlanner,
-AND DimSimDepthLidarModule) to odom_vo at once. A live Gate 2 run on the
-plain-nav blueprint showed this produces a visibly corrupted map -- "a lot
-of walls where they don't belong" -- since DimSimDepthLidarModule's
+Remapping ALL THREE real pose-consumers (AgenticFrontierSelector,
+ReplanningAStarPlanner, AND DimSimDepthLidarModule) to odom_vo at once
+produces a visibly corrupted map, since DimSimDepthLidarModule's
 point-cloud projection has no self-correction against VO drift the way
 ReplanningAStarPlanner's frequent replanning does. See
 sim_dimsim_vo_nav_blueprint.py's module docstring for the full mechanism.
-Now remaps ONLY the navigation-facing consumers:
+Remaps ONLY the navigation-facing consumers:
 - AgenticFrontierSelector.odom -- inherited unmodified from
   WavefrontFrontierExplorer.odom, used for frontier distance/direction
   scoring.
@@ -155,8 +153,7 @@ def build_sim_dimsim_agentic_vo(
             (VoxelGridMapper, "lidar", "depth_lidar"),
             (AgenticFrontierSelector, "color_image", "dimsim_color_image"),
             (ReplanningAStarPlanner, "global_costmap", "hazard_costmap"),
-            # PHASE 3 (2026-07-20), NAVIGATION ONLY -- see module
-            # docstring's SCOPE CHANGE section for why
+            # NAVIGATION ONLY -- see module docstring for why
             # DimSimDepthLidarModule is deliberately NOT remapped here.
             (ReplanningAStarPlanner, "odom", "odom_vo"),
             (AgenticFrontierSelector, "odom", "odom_vo"),

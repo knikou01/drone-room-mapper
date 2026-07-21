@@ -1,32 +1,28 @@
-"""DimSim + Visual SLAM blueprint -- PHASE 3: NAVIGATION pose driven by
-real VO (odom_vo). Mapping deliberately stays on ground truth -- see
-SCOPE CHANGE below.
+"""DimSim + Visual SLAM blueprint -- NAVIGATION pose driven by real VO
+(odom_vo). Mapping deliberately stays on ground truth -- see the scope
+note below.
 
-Near-identical to sim_dimsim_vo_blueprint.py (Phase 1/2: VO computed and
-compared against ground truth, but navigation/mapping still used ground
-truth /odom) -- added as a NEW, separate blueprint rather than editing
-that one in place, so the ground-truth-pose variant stays available for
-comparison/fallback (same "keep both" precedent as sim_dimsim_vo_blueprint.py
-coexisting with sim_dimsim_vo_only_blueprint.py).
+Near-identical to sim_dimsim_vo_blueprint.py (VO computed and compared
+against ground truth, but navigation/mapping still used ground truth
+/odom) -- added as a NEW, separate blueprint rather than editing that one
+in place, so the ground-truth-pose variant stays available for
+comparison/fallback (same "keep both" precedent as
+sim_dimsim_vo_blueprint.py coexisting with sim_dimsim_vo_only_blueprint.py).
 
-SCOPE CHANGE (2026-07-20), after live testing: the original plan remapped
-ALL THREE real pose-consumers (ReplanningAStarPlanner, WavefrontFrontierExplorer,
-AND DimSimDepthLidarModule) to odom_vo at once. A live Gate 2 run showed
-this produces a visibly corrupted map -- "a lot of walls where they don't
-belong." Root cause, not guessed: DimSimDepthLidarModule projects the
+Remapping ALL THREE real pose-consumers (ReplanningAStarPlanner,
+WavefrontFrontierExplorer, AND DimSimDepthLidarModule) to odom_vo at once
+produces a visibly corrupted map: DimSimDepthLidarModule projects the
 depth camera's points into world coordinates using whatever pose it's
 given, and VoxelGridMapper/CostMapper accumulate those points permanently
 with no mechanism to correct earlier contributions -- so every time VO's
-pose estimate is off (confirmed via live divergence-log measurement: real
-runs showed position errors over a metre and yaw errors of 100+ degrees
-at various points), the SAME physical wall gets projected to a DIFFERENT
-apparent world location, smearing/duplicating it in the accumulated map.
-Navigation decisions don't share this problem -- ReplanningAStarPlanner
-replans frequently against the LATEST pose, so it gets real-time
-self-correction that mapping structurally cannot get from a single-pass
-point accumulation.
+pose estimate is off, the SAME physical wall gets projected to a
+DIFFERENT apparent world location, smearing/duplicating it in the
+accumulated map. Navigation decisions don't share this problem --
+ReplanningAStarPlanner replans frequently against the LATEST pose, so it
+gets real-time self-correction that mapping structurally cannot get from
+a single-pass point accumulation.
 
-Given that asymmetry, this blueprint now remaps ONLY the navigation-facing
+Given that asymmetry, this blueprint remaps ONLY the navigation-facing
 pose consumers to odom_vo:
 - ReplanningAStarPlanner.odom -- real-time navigation/replanning pose.
 - WavefrontFrontierExplorer.odom -- frontier distance/direction scoring.
@@ -137,14 +133,13 @@ sim_dimsim_vo_nav = autoconnect(
     MovementManager.blueprint(),
 ).remappings(
     [
-        # Phase 2, unchanged from sim_dimsim_vo_blueprint.py.
+        # Unchanged from sim_dimsim_vo_blueprint.py.
         (VoxelGridMapper, "lidar", "depth_lidar"),
         (ObjectDBModule, "color_image", "dimsim_color_image"),
-        # PHASE 3 (2026-07-20), NAVIGATION ONLY -- see module docstring's
-        # SCOPE CHANGE section for why DimSimDepthLidarModule is
-        # deliberately NOT remapped here (stays on ground truth; a live
-        # test confirmed remapping it too corrupts the map, since mapping
-        # has no self-correction against VO drift the way replanning does).
+        # NAVIGATION ONLY -- see module docstring for why
+        # DimSimDepthLidarModule is deliberately NOT remapped here (stays
+        # on ground truth; mapping has no self-correction against VO drift
+        # the way replanning does).
         (ReplanningAStarPlanner, "odom", "odom_vo"),
         (WavefrontFrontierExplorer, "odom", "odom_vo"),
     ]

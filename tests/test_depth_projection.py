@@ -18,8 +18,6 @@ ray points exactly along body-forward with no left/right or up/down offset.
 
 import math
 import numpy as np
-import sys
-sys.path.insert(0, "/home/claude")
 
 # Re-implement just the projection function in isolation (no DimOS deps)
 # to mirror DroneDepthModule._project_to_world exactly.

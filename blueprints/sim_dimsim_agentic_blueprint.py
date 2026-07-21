@@ -1,37 +1,31 @@
 """DimSim visual-SLAM + agentic (LLM-driven) frontier exploration blueprint.
 
-Same vision-based mapping stack as sim_dimsim_vo_blueprint.py (Phase 2:
-DimSimDepthLidarModule's depth-derived point cloud feeds VoxelGridMapper
+Same vision-based mapping stack as sim_dimsim_vo_blueprint.py
+(DimSimDepthLidarModule's depth-derived point cloud feeds VoxelGridMapper
 INSTEAD of DimSim's raycast /lidar, pose from ground-truth /odom -- see that
 file's docstring for the full reasoning, unchanged here), with
 WavefrontFrontierExplorer swapped for AgenticFrontierSelector
 (drone/agentic_frontier_selector.py).
 
-ARCHITECTURE CHANGE (2026-07-20): AgenticFrontierSelector no longer has an
-LLM pick which frontier to explore next -- frontier SELECTION is plain
-WavefrontFrontierExplorer geometric heuristic now, unconditionally. Direct
-user call after a run of live tests kept surfacing new instability each
-time the previous one was fixed: "the A* exploration seems better than the
-agentic." The LLM's role here is now request-driven, not decision-per-step
--- see AgenticFrontierSelector's module docstring for the full reasoning
-and CONSOLE_SYSTEM_PROMPT below for exactly what the console can still do
-(start/stop exploration, drive directly, react to a live hazard via the
-background safety monitor).
+Frontier SELECTION is plain WavefrontFrontierExplorer geometric heuristic,
+unconditionally -- the LLM's role here is request-driven, not
+decision-per-step: see AgenticFrontierSelector's module docstring for the
+full reasoning and CONSOLE_SYSTEM_PROMPT below for exactly what the console
+can still do (start/stop exploration, drive directly, react to a live
+hazard via the background safety monitor).
 
 DimSimVisualOdometryModule is kept running for its own sake (ongoing
-VO-vs-ground-truth telemetry -- see its module docstring for the current,
-unresolved accuracy limitation) but nothing consumes odom_vo; navigation
-still uses ground-truth /odom.
+VO-vs-ground-truth telemetry -- see its module docstring for the current
+accuracy limitation) but nothing consumes odom_vo here; navigation still
+uses ground-truth /odom.
 
 Adds a natural-language console on top: McpServer + McpClient + WebInput,
 same pattern as blueprints/sim_agentic_blueprint.py, at
-http://localhost:5555. CONFIRMED BUG, FIXED HERE (2026-07-08): that older
-console's system prompt told the LLM to call tools named
-"begin_exploration"/"end_exploration", but WavefrontFrontierExplorer's
+http://localhost:5555. Note that WavefrontFrontierExplorer's
 explore()/stop_exploration() are @rpc, not @skill -- dimos/core/module.py's
-get_skills() only surfaces @skill-decorated methods to MCP, so those tool
-names never actually existed as callable tools. AgenticFrontierSelector now
-has real @skill-decorated begin_exploration/end_exploration wrappers (see
+get_skills() only surfaces @skill-decorated methods to MCP, so those names
+are not callable as console tools. AgenticFrontierSelector has real
+@skill-decorated begin_exploration/end_exploration wrappers instead (see
 that file) -- this blueprint's SYSTEM_PROMPT below lists the names that
 actually work.
 
@@ -47,21 +41,20 @@ connected BEFORE this blueprint starts (same as sim_dimsim_vo_blueprint.py).
 
 KNOWN ISSUE (see sim_dimsim_vo_blueprint.py's docstring for full detail):
 the apt scene's glass surface permanently wedges the robot on contact, not
-fixable from this repo. Frontier selection itself no longer does any
-glass-specific visual judgment call (see the 2026-07-20 architecture
-change above) -- the background safety monitor (see
+fixable from this repo. Frontier selection itself does no glass-specific
+visual judgment call -- the background safety monitor (see
 AgenticFrontierSelector's module docstring) is what actually watches the
 live camera for a hazard and reacts, independent of frontier decisions.
-This is still a best-effort visual judgment call, NOT a guaranteed fix:
-DimSim's simulated depth sensor may not perceive glass as an obstacle at
-all, in which case the geometric costmap data alone may already look like
-a clear opening. If the robot still gets stuck, that's this same known
-limitation, not a new bug.
+This is a best-effort visual judgment call, NOT a guaranteed fix: DimSim's
+simulated depth sensor may not perceive glass as an obstacle at all, in
+which case the geometric costmap data alone may already look like a clear
+opening. If the robot still gets stuck, that's this known limitation, not
+a new bug.
 
-KNOWN ISSUE, DIMOS BUG, NOT PART OF THIS TASK -- DO NOT ATTEMPT TO FIX
-(2026-07-09): end_exploration (this blueprint's begin_exploration/
-end_exploration skills, see agentic_frontier_selector.py) can trigger a
-real AssertionError in ../dimos/dimos/navigation/replanning_a_star/
+KNOWN ISSUE, DIMOS BUG, NOT PART OF THIS TASK -- DO NOT ATTEMPT TO FIX:
+end_exploration (this blueprint's begin_exploration/end_exploration
+skills, see agentic_frontier_selector.py) can trigger a real
+AssertionError in ../dimos/dimos/navigation/replanning_a_star/
 global_planner.py's _plan_path(): `assert current_goal is not None` at
 line 318. Root cause is a genuine check-then-act race in DimOS itself, not
 this repo: _plan_path() calls self.cancel_goal(but_will_try_again=True)
@@ -72,86 +65,62 @@ lock acquisitions, GlobalPlanner's own _on_stopped_navigating callback
 (subscribed in start(), fires on a different thread from the local
 planner's reactive stream) can call self.cancel_goal(arrived=True) --
 which DOES clear _current_goal, since but_will_try_again defaults False --
-right as _plan_path() is about to read it. Confirmed from a live log:
-"Cancelling goal. arrived=False but_will_try_again=True" (the
-_plan_path()-internal call) immediately followed by "Close enough to
-goal. Accepting as arrived." (the racing _on_stopped_navigating path),
-then the assert. Appears non-fatal in practice -- the LCM handler thread
-logs the exception and continues, exploration resumes fine on the next
-begin_exploration -- but it is a real bug in DimOS's navigation stack,
-not something introduced by this repo. Likely dormant until now because
-end_exploration never actually fired before the @skill fix in
-agentic_frontier_selector.py (see that file's docstring) -- so this path
-was never exercised via the MCP console until then.
+right as _plan_path() is about to read it. Appears non-fatal in
+practice -- the LCM handler thread logs the exception and continues,
+exploration resumes fine on the next begin_exploration -- but it is a real
+bug in DimOS's navigation stack, not something introduced by this repo.
 
-Confirmed (2026-07-15) this same race also triggers via the background
-safety monitor's _emergency_stop(): its zero-Twist publish on
-tele_cmd_vel is treated as teleop by MovementManager, which cancels the
-in-flight goal and races with the planner's own in-flight replan request
-for it -- confirmed by timestamps, not guessed (the "Got new goal" log
-line lands ~2ms after the stop, far too fast to be a fresh LLM frontier
-pick). Also seen a second downstream shape of the exact same race:
-`ValueError: No current global costmap available` in _find_safe_goal
-(global_planner.py:324), not just the AssertionError above -- same
-check-then-act window, different cleared state. Both confirmed non-fatal:
-logged and swallowed by the LCM handler thread, exploration recovers
-cleanly on the next begin_exploration. Still not fixed here, same reasons
-as above -- but now surfaces roughly every time the safety monitor stops
-the drone, since it cancels goals far more often than manual
-end_exploration did.
+This same race also triggers via the background safety monitor's
+_emergency_stop(): its zero-Twist publish on tele_cmd_vel is treated as
+teleop by MovementManager, which cancels the in-flight goal and races with
+the planner's own in-flight replan request for it. There is also a second
+downstream shape of the exact same race: `ValueError: No current global
+costmap available` in _find_safe_goal (global_planner.py:324), not just
+the AssertionError above -- same check-then-act window, different cleared
+state. Both are non-fatal: logged and swallowed by the LCM handler thread,
+exploration recovers cleanly on the next begin_exploration. Not fixed
+here, same reasons as above -- surfaces roughly every time the safety
+monitor stops the drone, since it cancels goals far more often than manual
+end_exploration.
 
-CONFIRMED BUG, FIXED HERE (2026-07-15): every real test still drove the
-robot into the glass despite reject_all and the strengthened prompt, even
-after the known-issue note above -- because the camera was only ever
-consulted at the moment a frontier TARGET was chosen, not while the path
-to it was being driven. AgenticFrontierSelector now runs a continuous
-background safety monitor (see that file's docstring, "Background safety
-monitor" section) that checks the live camera on its own timer and stops
-the drone immediately on a hazard, independent of frontier decisions.
+AgenticFrontierSelector runs a continuous background safety monitor (see
+that file's docstring, "Background safety monitor" section) that checks
+the live camera on its own timer and stops the drone immediately on a
+hazard, independent of frontier decisions -- because consulting the camera
+only at the moment a frontier TARGET is chosen isn't enough; the hazard
+can appear while the path to it is being driven.
 
 ObjectDBModule (object detection) is deliberately NOT part of this
-blueprint, removed here (2026-07-15) -- it was in earlier versions purely
-because it happened to need the same dimsim_color_image remap as
-AgenticFrontierSelector, but nothing in the exploration/mapping pipeline
-actually depends on it, and its auto-discovered ask_vlm MCP tool was
-broken for two independent reasons (missing ALIBABA_API_KEY, a separate
-get_next() timeout) and NOT excludable via CONSOLE_SYSTEM_PROMPT alone --
-MCP exposes every discovered tool to the real tool-calling schema
-regardless of what the prompt says. Removing the module removes the
-broken tool entirely rather than trying to prompt around it.
+blueprint -- nothing in the exploration/mapping pipeline depends on it,
+and its auto-discovered ask_vlm MCP tool is broken for two independent
+reasons (missing ALIBABA_API_KEY, a separate get_next() timeout) and not
+excludable via CONSOLE_SYSTEM_PROMPT alone -- MCP exposes every discovered
+tool to the real tool-calling schema regardless of what the prompt says.
+Removing the module removes the broken tool entirely rather than trying to
+prompt around it.
 
-ADDED (2026-07-15): the safety monitor above stopped the drone before
-glass contact, confirmed live -- but stopping alone meant the drone would
-just approach the same spot again later, since a confirmed hazard was
-only excluded from frontier TARGETS (AgenticFrontierSelector's own
-bookkeeping), not from the geometric costmap itself, which doesn't
-perceive glass as an obstacle at all. AgenticFrontierSelector now stamps
-every confirmed hazard into the costmap as a real occupied wall (see its
-hazard_costmap/_stamp_hazards) and republishes the patched grid on a new
-hazard_costmap stream; ReplanningAStarPlanner is remapped here to read
-THAT stream instead of CostMapper's raw global_costmap directly, so a
-confirmed hazard blocks A* path planning too, not just frontier
-selection -- the drone can no longer be routed through it on the way to
-some other frontier either.
+The safety monitor above stops the drone before glass contact, but
+stopping alone would mean the drone approaches the same spot again later,
+since a hazard would only be excluded from frontier TARGETS
+(AgenticFrontierSelector's own bookkeeping), not from the geometric
+costmap itself, which doesn't perceive glass as an obstacle at all.
+AgenticFrontierSelector stamps every confirmed hazard into the costmap as
+a real occupied wall (see its hazard_costmap/_stamp_hazards) and
+republishes the patched grid on a new hazard_costmap stream;
+ReplanningAStarPlanner is remapped here to read THAT stream instead of
+CostMapper's raw global_costmap directly, so a confirmed hazard blocks A*
+path planning too, not just frontier selection -- the drone can no longer
+be routed through it on the way to some other frontier either.
 
-CONFIRMED BUG, FIXED HERE (2026-07-16): the console's McpClient used to
-be hardcoded to Groq's Llama 4 Scout regardless of which provider the
-user picked for frontier selection -- meaning picking Gemini specifically
-to avoid a known-exhausted Groq daily quota didn't actually help, since
-the console itself still crashed on the same `groq.RateLimitError`
-(confirmed live twice in a row: `McpClient._process_message`'s LangGraph
-agent loop doesn't catch LLM call failures, so the exception kills the
-whole `McpClient-thread` -- a real dimos-level gap, not something fixed
-here, but avoidable by just not hitting Groq at all when the user didn't
-choose it). `build_sim_dimsim_agentic` now derives the console's model
-string from the SAME llm_provider/llm_model choice used for frontier
-selection, via _LANGCHAIN_PROVIDER_NAMES below -- our own "gemini" naming
-(AgenticFrontierConfig.llm_provider, used by AgenticFrontierSelector's
-own _build_llm_client) doesn't match langchain's init_chat_model-style
-provider-prefix dispatch, which expects "google_genai" specifically
-(confirmed by reading langchain/chat_models/base.py's provider table
-directly, not guessed) -- "anthropic"/"groq"/"openai" already match
-directly and need no remapping.
+`build_sim_dimsim_agentic` derives the console's model string from the
+SAME llm_provider/llm_model choice used for frontier selection, via
+_LANGCHAIN_PROVIDER_NAMES below, rather than hardcoding a fixed provider
+for the console -- otherwise picking a different provider specifically to
+dodge an exhausted quota on one provider wouldn't actually help, since the
+console would still use the hardcoded one. Note McpClient._process_message's
+LangGraph agent loop doesn't catch LLM call failures, so an exception there
+kills the whole McpClient-thread -- a dimos-level gap, not fixed here, but
+avoided by keeping console and frontier-selection providers in sync.
 """
 from __future__ import annotations
 
@@ -280,11 +249,10 @@ _rerun_config = {
 # AgenticFrontierSelector._build_llm_client, drone/agentic_frontier_selector.py)
 # to langchain's init_chat_model-style provider-prefix dispatch (used by
 # McpClient's model="provider:model" convention, dimos/agents/mcp/mcp_client.py)
-# -- only "gemini" needs remapping, confirmed by reading
-# langchain/chat_models/base.py's provider table directly: the real
-# registered name is "google_genai", not "gemini". "openai"/"anthropic"/
-# "groq" already match langchain's own provider names and pass through
-# unchanged (see the .get(llm_provider, llm_provider) fallback below).
+# -- only "gemini" needs remapping: langchain's registered name for it is
+# "google_genai", not "gemini". "openai"/"anthropic"/"groq" already match
+# langchain's own provider names and pass through unchanged (see the
+# .get(llm_provider, llm_provider) fallback below).
 _LANGCHAIN_PROVIDER_NAMES = {"gemini": "google_genai"}
 
 
@@ -294,16 +262,10 @@ def build_sim_dimsim_agentic(
     """Build the blueprint with the given LLM provider/model for
     AgenticFrontierSelector's frontier-selection calls. See module
     docstring for why this is a function rather than a module-level
-    constant.
+    constant, and for why the console uses this same provider/model choice
+    instead of a hardcoded one.
 
-    CONFIRMED BUG, FIXED (2026-07-16): the console's McpClient now uses
-    this SAME provider/model choice too, instead of being hardcoded to
-    Groq -- see the module docstring's 2026-07-16 note for why (picking
-    a different provider specifically to dodge an exhausted Groq quota
-    didn't help when the console ignored that choice and used Groq
-    anyway).
-
-    safety_monitor_enabled (2026-07-16): passed straight through to
+    safety_monitor_enabled is passed straight through to
     AgenticFrontierConfig -- see its docstring for why this needs to be
     toggleable (false positives on ordinary architecture when testing on
     a scene with no glass at all, e.g. apt_no_glass)."""

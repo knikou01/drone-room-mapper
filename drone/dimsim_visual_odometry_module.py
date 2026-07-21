@@ -1,112 +1,76 @@
 """
 DimSimVisualOdometryModule
 
-Phase 1 of visual-SLAM-instead-of-lidar work (see Vector's DimSim technical
-report, section 4). Computes RGB-D visual odometry from DimSim's color/depth
-LCM feed using Open3D's compute_rgbd_odometry, and publishes the accumulated
-pose on a SEPARATE topic (odom_vo) rather than replacing DimSim's own
-ground-truth /odom. This lets VO accuracy be measured against ground truth
-before it's trusted for navigation -- exactly the caution Vector's report
-recommends in its "Important caveat" (section 4.2).
+Computes RGB-D visual odometry from DimSim's color/depth LCM feed and
+publishes the accumulated pose on a SEPARATE topic (odom_vo) rather than
+replacing DimSim's own ground-truth /odom. This lets VO accuracy be
+measured against ground truth before it's trusted for navigation.
 
-Pattern reused directly from sim_camera/dimsim_camera_module.py (Vector's
-confirmed-working module): subscribe to DimSim's raw LCM topics via a
-standalone LCM() instance rather than declaring In[Image] streams, since
-DimSim's bridge publishes unconditionally on fixed topic names regardless
-of which DimOS blueprint is running. Reuses make_camera_info_default() and
-the depth-in-mm convention from that same module rather than re-deriving
-either.
+Pattern reused directly from sim_camera/dimsim_camera_module.py: subscribe
+to DimSim's raw LCM topics via a standalone LCM() instance rather than
+declaring In[Image] streams, since DimSim's bridge publishes unconditionally
+on fixed topic names regardless of which DimOS blueprint is running. Reuses
+make_camera_info_default() and the depth-in-mm convention from that same
+module rather than re-deriving either.
 
 Requires open3d (already a dependency -- VoxelGridMapper uses it).
 
 ------------------------------------------------------------------------
-KNOWN LIMITATION (2026-07-08) -- odom_vo used to not be accurate enough to
-trust for navigation with dense frame-to-frame odometry. Being addressed
-as of 2026-07-20 (Phase 3, see below) with a sparse feature-based
-tracking_method -- do not swap any consumer's pose input from ground-truth
-/odom to odom_vo until Phase 3's accuracy gates (see the Phase 3 plan,
-originally at ~/.claude/plans/radiant-strolling-book.md this session) are
-confirmed to pass via a real, measured live run.
+KNOWN LIMITATION -- odom_vo's accuracy is not reliable enough to trust for
+real navigation against DimSim's actual scene content. Do not swap any
+navigation/mapping consumer's pose input from ground-truth /odom to
+odom_vo without re-validating: drive a controlled path with
+run_sim_dimsim_vo_only.py and check the divergence log's delta ratios
+before trusting it.
 ------------------------------------------------------------------------
-Over a run with several real metres of ground-truth translation and 120+
-degrees of real ground-truth yaw change, the published odom_vo pose barely
-moved at all (~0.1-0.2m total, yaw pinned within a ~4 degree band) while
-_vo_success_count / _frame_count (compute_rgbd_odometry's own "success"
-flag) stayed at 99%. The coordinate-conversion math itself is verified
-correct by direct synthetic test (see _camera_to_world_pose's docstring)
--- this is not the same class of bug as the yaw-sign or origin-anchor
-issues fixed below. The leading hypothesis, grounded in what's directly
-observable rather than assumed: pairing_gap (see _last_pairing_gap_s)
-consistently runs 1000-1200ms even with system load minimized (and up to
-60000ms observed once under heavy unrelated system load), meaning
-consecutive color/depth frames can be a full second or more apart. Dense
-frame-to-frame RGBD odometry (tracking_method="dense") generally assumes
-small motion between consecutive frames; fed a large real gap, it's a
-known failure mode for the optimizer to converge to a near-identity
-transform while still reporting success=True, rather than actually
-failing loudly.
+Two tracking methods are available (tracking_method config field):
 
-CONFIRMED (2026-07-20), via direct source reads of ../DimSim/src/engine.js
-and ../DimSim/src/dimos/dimosBridge.ts, not guessed: DimSim's own
-image-capture path does a full extra scene render plus a SYNCHRONOUS
-`renderer.readRenderTargetPixels(...)` GPU readback on every capture (a
-known Three.js stall -- a real "GPU stall due to ReadPixels" browser
-console warning was observed directly this session), instead of the
-available async, WebGL2-PBO-based `readRenderTargetPixelsAsync()`. This is
-a stronger, source-verified root-cause candidate for the pairing_gap
-symptom than "dense odometry just doesn't like large gaps" alone -- it
-explains why images publish far slower than DimSim's own nominal 5Hz
-design target (DEFAULT_RATES.images=200ms in dimosBridge.ts), especially
-under any system load. Not fixed in DimSim itself as of this addition
-(2026-07-20) -- see tracking_method below for the algorithm-side mitigation
-tried first instead, per user decision to try the cheaper, contained fix
-before touching a sibling repo's render pipeline.
+"dense" -- Open3D's compute_rgbd_odometry, a photometric+geometric
+frame-to-frame optimizer. Assumes small motion between consecutive frames;
+when DimSim's color/depth capture rate is slow (pairing_gap large), the
+optimizer can silently converge to a near-identity transform while still
+reporting success=True instead of failing loudly. Kept for A/B comparison,
+not the default.
 
-PHASE 3 ADDITION (2026-07-20): tracking_method="sparse" (the new default)
-replaces compute_rgbd_odometry with ORB feature matching + depth-based
-3D-3D RANSAC rigid alignment (see _compute_transform_sparse), which does
-NOT share dense odometry's small-motion assumption -- ORB descriptor
-matching is designed for wide baselines (large motion between frames),
-the opposite of what dense photometric/geometric alignment needs. Depth is
-available on both the previous and current frame, so each matched 2D
-keypoint pair unprojects to a genuine 3D-3D correspondence (not 2D-3D
-PnP), giving an absolute-scale rigid transform directly via Kabsch/SVD on
-the RANSAC inlier set. tracking_method="dense" is kept available (not
-removed) for A/B comparison and as a trivial revert path -- see
-_compute_transform_dense.
-
-Accuracy gates for calling this "good enough" to actually swap navigation
-pose sources onto (see the Phase 3 plan): Gate 0 -- over any ~2s window,
-VO displacement / ground-truth displacement ratio in [0.5x, 2x], both
-translation and yaw (distinguishes "frozen" from "tracking," which
-cumulative absolute error alone can't do -- see _maybe_log_divergence's
-new delta/ratio fields). Gate 1 -- drift <=5% of distance traveled,
-position error <=0.2m sustained (matches ReplanningAStarPlanner's own
-_goal_tolerance), yaw error <=5deg sustained (well inside its 15deg
-_rotation_tolerance). These gates have NOT yet been confirmed passing via
-a real live run as of this code addition -- that is the next step, not
-something this change alone establishes.
+"sparse" (default) -- ORB feature matching + depth-based 3D-3D RANSAC
+rigid alignment (see _compute_transform_sparse), tolerant of larger,
+irregular inter-frame gaps since it doesn't share dense odometry's
+small-motion assumption. Depth is available on both frames, so each
+matched keypoint pair unprojects to a genuine 3D-3D correspondence (not
+2D-3D PnP), giving an absolute-scale rigid transform via Kabsch/SVD on the
+RANSAC inlier set. Three layers of rejection guard against publishing a
+wrong-but-plausible-looking transform (all treated as tracking failures,
+not published): too few matches/inliers, near-planar/degenerate matched-
+point geometry (min_point_spread_ratio), and physically-implausible
+implied speed (max_linear_mps/max_angular_rps, checked against the real
+elapsed time between frames). In practice, even with these safeguards,
+DimSim's actual rendered scenes often don't have enough distinctive visual
+texture for reliable ORB matching -- real-world success rate has been
+observed in the single digits percent. _reject_counts (see __init__)
+tracks which check is responsible, surfaced in the periodic divergence log.
 
 ------------------------------------------------------------------------
-OPEN QUESTIONS, RESOLVED:
+Design notes:
 ------------------------------------------------------------------------
-1. Color/depth pairing gap: NOT small -- see KNOWN LIMITATION above.
-   Logged via pairing_gap in every divergence line.
+1. Color/depth pairing: process on every color arrival using whatever
+   depth is most recently available (see _on_color_image). pairing_gap
+   (logged every divergence line) tracks how close the pairing actually is.
 
-2. Coordinate frame conversion: verified correct via synthetic test (see
-   _camera_to_world_pose). A real sign bug was found and fixed in the yaw
-   extraction; translation extraction was already correct.
+2. Coordinate frame conversion (see _camera_to_world_pose): Open3D/OpenCV
+   camera convention is X=right, Y=down, Z=forward; DimOS/ROS world
+   convention is X=forward, Y=left, Z=up. Axis remap: X_dimos = Z_cam,
+   Y_dimos = -X_cam, Z_dimos = -Y_cam. Verified via synthetic test (fed a
+   hand-built rotation matrix representing a known pure world-yaw, checked
+   the extracted yaw matches).
 
 3. Depth scale: RGBDImage.create_from_color_and_depth defaults to
    depth_scale=1000.0, which matches DimSim's raw uint16-millimeter depth
-   format exactly (confirmed from DimSimCameraModule's own
-   `depth_m = self._latest_depth.data.astype(np.float32) / 1000.0` line) --
-   so raw depth data is passed to Open3D WITHOUT pre-dividing by 1000, to
-   let Open3D's own depth_scale handle it consistently with its internal
-   pyramid/gradient computations. This is different from
-   DimSimCameraModule's own point-cloud code, which does divide by 1000
-   itself for a different purpose (manual unprojection). Do not copy that
-   division pattern into this module's RGBDImage construction.
+   format exactly -- so raw depth data is passed to Open3D WITHOUT
+   pre-dividing by 1000, letting Open3D's own depth_scale handle it
+   consistently with its internal pyramid/gradient computations. Do not
+   copy DimSimCameraModule's point-cloud division pattern into this
+   module's RGBDImage construction -- different purpose (manual
+   unprojection vs. Open3D's internal handling).
 ------------------------------------------------------------------------
 """
 from __future__ import annotations
@@ -131,9 +95,8 @@ from sim_camera.dimsim_camera_module import make_camera_info_default
 
 # Topic names duplicated from dimsim_camera_module.py rather than imported,
 # since that module's _RAW_*_TOPIC constants are underscore-prefixed
-# (private) -- not a contract Vector has committed to keeping stable for
-# external imports. If DimSim's bridge topic names ever change, both this
-# file and dimsim_camera_module.py need updating together.
+# (private) -- not a stable cross-module contract. If DimSim's bridge topic
+# names ever change, both files need updating together.
 _RAW_COLOR_TOPIC = "/color_image"
 _RAW_DEPTH_TOPIC = "/depth_image"
 _RAW_ODOM_TOPIC = "/odom"
@@ -142,22 +105,14 @@ logger = setup_logger()
 
 
 class DimSimVisualOdometryConfig(ModuleConfig):
-    # PHASE 3 ADDITION (2026-07-20): "sparse" (ORB feature matching +
-    # depth-based 3D-3D RANSAC, see _compute_transform_sparse) is the new
-    # default -- tolerant of the large, irregular inter-frame gaps that
-    # broke "dense" (compute_rgbd_odometry's small-motion-assuming
-    # optimizer, see _compute_transform_dense). "dense" is kept, not
-    # removed, for A/B comparison and as a one-line revert. See the module
-    # docstring's PHASE 3 ADDITION section for the full reasoning.
     tracking_method: Literal["dense", "sparse"] = "sparse"
     min_depth_m: float = 0.05
     max_depth_m: float = 15.0
     # ORB/RANSAC tuning for tracking_method="sparse" -- unused when "dense".
     orb_n_features: int = 500
     # Lowe's ratio test threshold for BFMatcher.knnMatch(k=2) -- standard
-    # default (0.75, per Lowe's original SIFT paper, commonly reused for
-    # ORB too) rejects ambiguous matches where the best and second-best
-    # match are too close in descriptor distance to trust.
+    # default (0.75), rejects ambiguous matches where the best and
+    # second-best match are too close in descriptor distance to trust.
     orb_ratio_test_threshold: float = 0.75
     # Inlier distance threshold (metres) for cv2.estimateAffine3D's
     # internal RANSAC -- how far a matched 3D-3D correspondence pair is
@@ -165,65 +120,33 @@ class DimSimVisualOdometryConfig(ModuleConfig):
     # rejected as an outlier (e.g. a wrong ORB match, or a point whose
     # depth reading was noisy).
     ransac_reproj_threshold_m: float = 0.05
-    # CONFIRMED BUG, FIXED (2026-07-20), found via a real live run: with
-    # DimSim's simulated depth noise/speckle OFF by default (ruled out as
-    # the cause, confirmed via engine.js's rgbdNoiseEnabled/
-    # rgbdSpeckleEnabled defaulting to false), the sparse tracker still
-    # produced badly noisy results against a real room -- e.g. one
-    # interval reported 5.15x/3.88x the ground-truth displacement, another
-    # 0.26x/0.01x, alongside genuinely accurate intervals in between
-    # (1.18x/1.00x). Root cause: unlike the pure-random-noise synthetic
-    # test this was validated against (globally unique texture everywhere,
-    # an easy case for feature matching), a real room has repetitive/
-    # ambiguous structure (blank walls, symmetric furniture) that can let
-    # RANSAC converge on a plausible-looking but WRONG consensus among a
-    # small number of points, especially with only ransac_min_inliers=8
-    # required (too low a bar for a well-conditioned 3D fit) and no
-    # sanity check on whether the resulting transform is even physically
-    # possible. Raised the inlier bar and added
-    # max_linear_mps/max_angular_rps below (see _compute_transform_sparse)
-    # as a second, independent line of defense: reject a transform outright
-    # if it implies faster motion than the simulated robot can plausibly
-    # achieve, regardless of how many RANSAC inliers agreed with it.
+    # Minimum RANSAC inliers required to trust a fit -- a real room's
+    # repetitive/ambiguous structure (blank walls, symmetric furniture)
+    # can let RANSAC converge on a plausible-looking but wrong consensus
+    # among too few points. See max_linear_mps/max_angular_rps below for a
+    # second, independent line of defense against this.
     ransac_min_inliers: int = 15
     # Physical plausibility bounds for tracking_method="sparse" -- a
     # computed transform is rejected (treated as a tracking failure, not
     # published) if it implies an average speed/turn-rate above these,
     # given the REAL elapsed wall-clock time between the two frames (not
-    # assumed small -- this module's whole reason for existing is that the
-    # gap is often large and irregular). Deliberately generous (well above
-    # any expected real driving speed for this simulated ground robot) --
-    # this is a sanity backstop against a clearly-wrong RANSAC consensus,
-    # not a tight motion model.
+    # assumed small). Deliberately generous (well above any expected real
+    # driving speed for this simulated ground robot) -- a sanity backstop
+    # against a clearly-wrong RANSAC consensus, not a tight motion model.
     max_linear_mps: float = 3.0
     max_angular_rps: float = 6.0  # ~344 deg/s
-    # CONFIRMED BUG, FIXED (2026-07-20), found via a real live navigation
-    # run: a near-planar or near-collinear matched-point configuration
-    # (e.g. facing a flat wall head-on) can still produce a numerically
-    # "valid" fit with plenty of raw point COUNT (clearing
-    # ransac_min_inliers easily), but the resulting rigid transform is
-    # poorly constrained -- certain rotations are barely observable from
-    # data that's essentially 2D or 1D, regardless of how many points
-    # agree on it. Confirmed live: raw "not enough matching points"
-    # warnings from cv2.estimateAffine3D's own C++ internals (printed
-    # directly to stdout, not through this module's logging -- no
-    # timestamp prefix) coincided with VO reporting 0.128m/3.4deg of
-    # motion while the robot had actually moved 2.096m/61.2deg (ratio
-    # 0.06x/0.06x) -- a small, "plausible-looking" WRONG answer that
-    # max_linear_mps/max_angular_rps above can't catch, since that filter
-    # only rejects implausibly FAST motion, not implausibly small/frozen
-    # motion from degenerate geometry -- this is the SAME class of
-    # "frozen VO" symptom as dense odometry's original failure mode, just
-    # from a different root cause (geometric conditioning, not a
-    # small-motion optimizer assumption). Guards against it by requiring
-    # the matched 3D points to have genuine spread in all three
-    # dimensions (see _compute_transform_sparse's singular-value check) --
-    # not just tuned empirically against one live failure, but a real,
-    # well-understood numerical-conditioning requirement for a full 3D
-    # rigid fit to be well-determined at all. 0.05 is a conservative
-    # starting point (rejects clearly-degenerate near-planar/collinear
-    # cases without being overly strict on genuinely-3D-but-somewhat-flat
-    # real scenes) -- may need retuning after more live testing.
+    # Minimum ratio between the smallest and largest singular value of the
+    # matched 3D points' spread (after centering). Guards against a
+    # different failure mode than the checks above: a near-planar or
+    # near-collinear point configuration (e.g. facing a flat wall
+    # head-on) can pass every count-based check while still being
+    # numerically ill-conditioned for a full 3D rigid fit -- rotation
+    # about axes within that near-plane is barely observable from the
+    # data at all, regardless of how many points agree on it. See
+    # _compute_transform_sparse's singular-value check. 0.05 is a
+    # conservative starting point (rejects clearly-degenerate cases
+    # without being overly strict on genuinely-3D-but-somewhat-flat real
+    # scenes).
     min_point_spread_ratio: float = 0.05
 
 
@@ -231,9 +154,9 @@ class DimSimVisualOdometryModule(Module):
     """RGB-D visual odometry over DimSim's color/depth feed.
 
     Publishes accumulated pose on odom_vo (NOT odom -- see module docstring
-    for why ground truth is left untouched during this validation phase),
-    plus periodic divergence logging against DimSim's real /odom so VO
-    accuracy can be assessed before anything downstream depends on it.
+    for why ground truth is left untouched), plus periodic divergence
+    logging against DimSim's real /odom so VO accuracy can be assessed
+    before anything downstream depends on it.
     """
 
     config: DimSimVisualOdometryConfig
@@ -267,10 +190,9 @@ class DimSimVisualOdometryModule(Module):
 
         # Ground-truth position/yaw at the last divergence-log tick, so
         # _maybe_log_divergence can report a per-interval DELTA (this
-        # tick's motion) alongside the existing cumulative fields -- see
-        # that method's docstring for why cumulative error alone can't
-        # distinguish "frozen" from "genuinely accurate" (Gate 0, module
-        # docstring). None until the first log tick has a prior sample to
+        # tick's motion) alongside the cumulative fields -- cumulative
+        # error alone can't distinguish "frozen" from "genuinely
+        # accurate." None until the first log tick has a prior sample to
         # diff against.
         self._last_log_gt_pos: tuple[float, float, float] | None = None
         self._last_log_gt_yaw: float | None = None
@@ -282,19 +204,13 @@ class DimSimVisualOdometryModule(Module):
         self._gt_yaw = 0.0
         self._last_divergence_log = 0.0
 
-        # CONFIRMED BUG, FIXED (2026-07-08): self._accumulated_transform
-        # always starts at identity, i.e. VO always assumes it starts at
-        # world origin with zero heading -- but the drone's real spawn
-        # pose is whatever DimSim placed it at (e.g. (3,2,0.54) observed
-        # in one run). Without anchoring to the real starting pose, every
-        # published odom_vo pose (and every divergence-log comparison
-        # against ground truth) is offset by that fixed, uninteresting
-        # distance regardless of how accurately relative motion is
-        # tracked -- confirmed directly: a run where the robot never
-        # moved at all (stuck against a wall) still reported
-        # position_error=3.646m, which is exactly
-        # sqrt(3**2 + 2**2 + 0.54**2), i.e. purely the unanchored offset,
-        # not a tracking error. Latched once from the first real
+        # self._accumulated_transform always starts at identity, i.e. VO
+        # always assumes it starts at world origin with zero heading --
+        # but the drone's real spawn pose is whatever DimSim placed it at.
+        # Without anchoring to the real starting pose, every published
+        # odom_vo pose (and every divergence-log comparison) is offset by
+        # that fixed, uninteresting distance regardless of how accurately
+        # relative motion is tracked. Latched once from the first real
         # ground-truth sample in _on_ground_truth_odom below, then applied
         # in _camera_to_world_pose so published/compared poses reflect
         # absolute world position instead of "motion since VO's arbitrary
@@ -306,24 +222,20 @@ class DimSimVisualOdometryModule(Module):
         self._vo_success_count = 0
         self._last_pairing_gap_s = 0.0
 
-        # PHASE 3 ADDITION (2026-07-20): per-interval breakdown of WHY
-        # tracking_method="sparse" rejected a frame, reset every
-        # _DIVERGENCE_LOG_INTERVAL_S tick (see _maybe_log_divergence) --
-        # added after a live run showed success_rate crash to 3% right
-        # after the stricter ransac_min_inliers/min_point_spread_ratio
-        # fixes landed, with no way to tell from the log alone WHICH
-        # check was actually responsible without enabling full debug
-        # logging (too noisy at several frames/sec to use live). Keys
-        # match _reject()'s reason strings below.
+        # Per-interval breakdown of WHY tracking_method="sparse" rejected
+        # a frame, reset every _DIVERGENCE_LOG_INTERVAL_S tick (see
+        # _maybe_log_divergence) -- useful for telling which specific
+        # check (too few matches, degenerate geometry, implausible speed)
+        # is responsible for a low success rate, without needing to
+        # enable full debug logging (too noisy at several frames/sec to
+        # use live). Keys match _reject()'s reason strings below.
         self._reject_counts: dict[str, int] = {}
 
     @rpc
     def start(self) -> None:
-        import open3d as o3d  # deferred import, same reasoning as
-                               # DroneDepthModule's transformers import:
-                               # avoid the heavy import cost in the
-                               # coordinator process, only pay it in the
-                               # worker after fork.
+        import open3d as o3d  # deferred import: modules run in forkserver
+                               # worker processes, so pay this import cost
+                               # after fork, not in the coordinator.
         self._o3d = o3d
         self._intrinsic = o3d.camera.PinholeCameraIntrinsic(
             width=self._camera_info.width,
@@ -334,17 +246,9 @@ class DimSimVisualOdometryModule(Module):
             cy=self._camera_info.K[5],
         )
         self._odo_option = o3d.pipelines.odometry.OdometryOption()
-        # CORRECTED: the actual OdometryOption attributes are depth_min/
-        # depth_max, not min_depth/max_depth (confirmed from the object's
-        # own repr: OdometryOption(iteration_number_per_pyramid_level=...,
-        # depth_diff_max=0.03, depth_min=0, depth_max=4)). The first attempt
-        # used min_depth/max_depth by mistake, conflating the
-        # compute_rgbd_odometry() function's descriptive parameter docs
-        # with OdometryOption's real field names -- caught via AttributeError
-        # on first real run. Keep consistent with DimSimCameraModule's own
-        # valid-depth window (0.05m-15.0m) so results are comparable, though
-        # these fields specifically gate the odometry correspondence search,
-        # not point-cloud filtering.
+        # OdometryOption's actual attributes are depth_min/depth_max, not
+        # min_depth/max_depth -- easy to get wrong since
+        # compute_rgbd_odometry()'s own parameter docs use different names.
         self._odo_option.depth_min = self.config.min_depth_m
         self._odo_option.depth_max = self.config.max_depth_m
 
@@ -377,33 +281,21 @@ class DimSimVisualOdometryModule(Module):
         if self._origin_pos is None:
             self._origin_pos = self._gt_pos
             self._origin_yaw = self._gt_yaw
-            # CONFIRMED BUG, FIXED (2026-07-20), found via a real live
-            # Phase 3 navigation run: odom_vo previously only ever
-            # published AFTER a successful tracked transform -- but
-            # WavefrontFrontierExplorer/ReplanningAStarPlanner (once
-            # remapped to consume odom_vo instead of ground truth, see
-            # sim_dimsim_vo_nav_blueprint.py) need at least one odom
-            # message before they can pick/pursue a goal at all, and the
-            # robot needs a goal before anything commands it to move. If
-            # the spawn view happens to be geometrically simple (e.g.
-            # facing a flat wall closely), _compute_transform_sparse's own
-            # min_point_spread_ratio check (correctly) keeps rejecting
-            # every attempt -- and since the robot never moves, the view
-            # never changes, so VO never gets a chance to succeed either.
-            # A real, observed chicken-and-egg deadlock: confirmed live,
-            # zero "VO vs ground-truth" log lines appeared in 90+ seconds
-            # of runtime (that log only fires after a successful
-            # transform), while begin_exploration silently never
-            # published a single frontier goal. Fixed by publishing an
-            # initial odom_vo message immediately here, at this exact
-            # origin-anchored pose -- not fabricated information: at this
-            # instant self._accumulated_transform is still identity (no
-            # relative motion has been observed yet), so "VO's estimate"
-            # and "the spawn pose" are the same thing by construction.
-            # This only unblocks the bootstrap -- every subsequent
-            # odom_vo update still goes through the exact same tracking
-            # and validation pipeline as before, none of the accuracy
-            # filters are weakened.
+            # Publish an initial odom_vo message immediately, at this
+            # exact origin-anchored pose, rather than waiting for the
+            # first successful tracked transform. Without this, any
+            # consumer that needs at least one odom message before acting
+            # (e.g. a frontier explorer picking a goal) can never get
+            # started if the robot's spawn view happens to make VO's own
+            # tracking checks fail on every attempt -- since the robot
+            # then never moves, the view never changes either, and
+            # nothing breaks the cycle. Not fabricated information: at
+            # this instant self._accumulated_transform is still identity
+            # (no relative motion has been observed yet), so "VO's
+            # estimate" and "the spawn pose" are the same thing by
+            # construction. Only unblocks the bootstrap -- every
+            # subsequent odom_vo update still goes through the normal
+            # tracking/validation pipeline unweakened.
             self.odom_vo.publish(
                 self._camera_to_world_pose(self._accumulated_transform, time.time())
             )
@@ -419,8 +311,7 @@ class DimSimVisualOdometryModule(Module):
         self._latest_color = msg
         # Pairing strategy: process on every color arrival using whatever
         # depth is most recently available. Mirrors DimSimCameraModule's
-        # _maybe_publish_pointcloud precedent (see open question #1 above
-        # regarding pairing quality).
+        # _maybe_publish_pointcloud precedent.
         if self._latest_depth is not None:
             try:
                 self._process_frame(msg, self._latest_depth)
@@ -436,18 +327,13 @@ class DimSimVisualOdometryModule(Module):
 
     def _process_frame(self, color: Image, depth: Image) -> None:
         self._frame_count += 1
-
-        # Open question #1 (module docstring): are color/depth actually
-        # paired closely in time, or could stale pairing be degrading VO
-        # accuracy? Track it so _maybe_log_divergence can report it
-        # alongside pose error instead of leaving this unanswered.
         self._last_pairing_gap_s = abs(color.ts - depth.ts)
 
         # color.data confirmed RGB/BGR uint8 HxWx3 from Image dataclass
         # (sensor_msgs/Image.py).
         color_np = color.to_rgb().data
-        depth_np = depth.data  # raw uint16 mm, per open question #3 above --
-                                # deliberately NOT divided by 1000 here.
+        depth_np = depth.data  # raw uint16 mm -- deliberately NOT divided
+                                # by 1000 here, see module docstring note 3.
 
         if self.config.tracking_method == "sparse":
             depth_m = depth_np.astype(np.float32) / 1000.0
@@ -484,12 +370,9 @@ class DimSimVisualOdometryModule(Module):
             pose = self._camera_to_world_pose(self._accumulated_transform, color.ts)
             self.odom_vo.publish(pose)
 
-        # PHASE 3 ADDITION (2026-07-20): unconditional, not gated behind
-        # `success` -- a live run showed tracking_method="sparse" succeed
-        # on as few as ~3% of frames after the stricter rejection filters
-        # landed, which made the OLD success-gated call to this method
-        # nearly silent right when its diagnostic breakdown (see
-        # _reject_counts) was needed most. Uses the current (possibly
+        # Unconditional, not gated behind `success` -- at a low success
+        # rate, a success-gated log call goes nearly silent right when its
+        # diagnostic breakdown is needed most. Uses the current (possibly
         # stale, if nothing succeeded this interval) accumulated pose --
         # that staleness is itself the useful signal (delta: vo=0.000m
         # means VO genuinely didn't update, not that it's hiding
@@ -501,12 +384,11 @@ class DimSimVisualOdometryModule(Module):
     def _compute_transform_dense(
         self, color_np: np.ndarray, depth_np: np.ndarray
     ) -> tuple[bool, np.ndarray]:
-        """Original Phase 1 approach: compute_rgbd_odometry, Open3D's dense
-        photometric+geometric frame-to-frame optimizer. Assumes small
-        motion between consecutive frames -- see the module docstring's
-        KNOWN LIMITATION section for why this fails when pairing_gap is
-        large. Kept for A/B comparison against tracking_method="sparse",
-        not the default anymore."""
+        """Open3D's compute_rgbd_odometry, a dense photometric+geometric
+        frame-to-frame optimizer. Assumes small motion between consecutive
+        frames -- see module docstring for why this fails when
+        pairing_gap is large. Kept for A/B comparison against
+        tracking_method="sparse", not the default."""
         o3d = self._o3d
         o3d_color = o3d.geometry.Image(np.ascontiguousarray(color_np))
         o3d_depth = o3d.geometry.Image(np.ascontiguousarray(depth_np))
@@ -541,10 +423,9 @@ class DimSimVisualOdometryModule(Module):
         prev_depth_m: np.ndarray,
         dt: float,
     ) -> tuple[bool, np.ndarray]:
-        """PHASE 3 ADDITION (2026-07-20): 3D-3D rigid alignment via ORB
-        feature matching + RANSAC, tolerant of large/irregular inter-frame
-        gaps unlike _compute_transform_dense -- see module docstring's
-        PHASE 3 ADDITION section for why.
+        """3D-3D rigid alignment via ORB feature matching + RANSAC,
+        tolerant of large/irregular inter-frame gaps unlike
+        _compute_transform_dense.
 
         Depth is available on BOTH frames (unlike a typical monocular VO
         setup), so each matched 2D keypoint pair unprojects to a genuine
@@ -657,19 +538,14 @@ class DimSimVisualOdometryModule(Module):
         src_c = src - src_mean
         dst_c = dst - dst_mean
 
-        # CONFIRMED BUG, FIXED (2026-07-20) -- see
-        # min_point_spread_ratio's docstring for the full live-run
-        # evidence. A near-planar/near-collinear point set can pass every
-        # check above (enough raw matches, enough RANSAC inliers) while
-        # still being numerically ill-conditioned for a full 3D rigid fit
-        # -- e.g. facing a flat wall head-on gives points with almost no
-        # spread along the depth axis, so rotation about axes within that
-        # near-plane is barely observable from the data at all. Check the
-        # singular values of the (already-centered) inlier point cloud's
-        # spread directly -- three values, one per principal axis, largest
-        # to smallest. A tiny smallest-to-largest ratio means the points
-        # are essentially 2D (or worse, 1D), regardless of how many of
-        # them there are.
+        # A near-planar/near-collinear point set can pass every check
+        # above (enough raw matches, enough RANSAC inliers) while still
+        # being numerically ill-conditioned for a full 3D rigid fit -- see
+        # min_point_spread_ratio's docstring. Check the singular values of
+        # the (already-centered) inlier point cloud's spread directly --
+        # three values, one per principal axis, largest to smallest. A
+        # tiny smallest-to-largest ratio means the points are essentially
+        # 2D (or worse, 1D), regardless of how many of them there are.
         spread = np.linalg.svd(src_c, compute_uv=False)
         if spread[0] < 1e-9 or (spread[-1] / spread[0]) < self.config.min_point_spread_ratio:
             logger.debug(
@@ -694,19 +570,16 @@ class DimSimVisualOdometryModule(Module):
         trans[:3, :3] = R
         trans[:3, 3] = t
 
-        # CONFIRMED BUG, FIXED (2026-07-20), found via a real live run: a
-        # RANSAC consensus can still converge on a plausible-looking but
-        # WRONG transform in a real room's repetitive/ambiguous geometry
-        # (a live run showed one interval reporting 5.15x the true
-        # displacement) -- raising ransac_min_inliers alone wasn't a
-        # complete fix, since a wrong-but-internally-consistent cluster of
-        # matches can still clear a higher inlier bar. Final backstop:
-        # reject the transform outright if it implies an average speed or
-        # turn-rate beyond what this simulated robot could plausibly
-        # achieve, given dt (the REAL elapsed time between the two
-        # frames -- not assumed small, per this module's whole reason for
-        # existing). Cheap to compute (just the already-known R, t) and
-        # independent of how many points agreed on the wrong answer.
+        # Final backstop: reject the transform outright if it implies an
+        # average speed or turn-rate beyond what this simulated robot
+        # could plausibly achieve, given dt (the real elapsed time between
+        # the two frames). A RANSAC consensus can converge on a plausible-
+        # looking but wrong transform in a real room's repetitive/
+        # ambiguous geometry -- raising ransac_min_inliers alone isn't a
+        # complete defense, since a wrong-but-internally-consistent
+        # cluster of matches can still clear a higher inlier bar. Cheap to
+        # compute (just the already-known R, t) and independent of how
+        # many points agreed on the wrong answer.
         speed_mps = float(np.linalg.norm(t)) / dt
         angle_rad = math.acos(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0))
         rate_rps = angle_rad / dt
@@ -727,50 +600,24 @@ class DimSimVisualOdometryModule(Module):
         DimOS-convention world-frame PoseStamped.
 
         Open3D/OpenCV camera convention: X=right, Y=down, Z=forward.
-        DimOS/ROS world convention (confirmed from global_planner.py,
-        mavlink_connection.py): X=forward, Y=left, Z=up.
-
+        DimOS/ROS world convention: X=forward, Y=left, Z=up.
         Axis remap: X_dimos = Z_cam, Y_dimos = -X_cam, Z_dimos = -Y_cam.
-
-        CONFIRMED BUG, FIXED (2026-07-08): verified against ground-truth
-        divergence logging exactly as flagged below -- a live run showed
-        gt_yaw swinging up to ~0.7rad while the published vo yaw stayed
-        under ~0.04rad, a ~17x underestimate. Root-caused with a synthetic
-        test (not the live run itself, which only proved *something* was
-        wrong): fed _camera_to_world_pose a hand-built camera-frame
-        rotation matrix representing a KNOWN pure world-yaw of theta, for
-        theta in +-{10,30,45,90,135} degrees. The translation extraction
-        recovered the expected value correctly in every case. The yaw
-        extraction recovered exactly -theta every time -- correct
-        magnitude, flipped sign. Fixed by negating r[0, 2] below.
-        (The residual under-tracking possibility -- that
-        self._accumulated_transform's own composition order/convention may
-        not fully match Open3D's compute_rgbd_odometry semantics -- was
-        NOT ruled out by this test, since the test only exercises the
-        final-matrix-to-Euler extraction step in isolation, not the
-        multi-frame accumulation itself. Re-check divergence numbers after
-        this fix before concluding VO is accurate enough for Phase 3.)
         """
         cam_x, cam_y, cam_z = transform[0, 3], transform[1, 3], transform[2, 3]
         world_x = cam_z
         world_y = -cam_x
         world_z = -cam_y
 
-        # Extract yaw from the rotation submatrix. Camera-frame yaw (rotation
-        # about camera Y / dimos -Z... ) -- approximated here via the
-        # standard atan2 decomposition of the remapped rotation. Flagged
-        # as unvalidated along with the translation remap above.
+        # Extract yaw from the rotation submatrix via atan2 on the
+        # remapped rotation axes -- sign confirmed via synthetic test
+        # (hand-built rotation matrix representing a known pure world-yaw).
         r = transform[:3, :3]
-        # Remap rotation matrix axes the same way as translation, then
-        # extract yaw (rotation about world Z) via atan2. Sign confirmed
-        # via synthetic test -- see docstring above.
         world_yaw = math.atan2(-r[0, 2], r[2, 2])
 
         # Anchor VO's start-relative motion onto the drone's real starting
         # pose -- see __init__ comment on self._origin_pos. Falls back to
         # no anchor (origin at world 0,0,0/yaw 0) if no ground-truth sample
-        # has arrived yet, matching the old (buggy) behavior only for that
-        # brief startup window.
+        # has arrived yet.
         origin_x, origin_y, origin_z = self._origin_pos or (0.0, 0.0, 0.0)
         origin_yaw = self._origin_yaw or 0.0
         cos_o, sin_o = math.cos(origin_yaw), math.sin(origin_yaw)
@@ -810,18 +657,16 @@ class DimSimVisualOdometryModule(Module):
             self._vo_success_count / self._frame_count if self._frame_count else 0.0
         )
 
-        # PHASE 3 ADDITION (2026-07-20): per-interval DELTA (this window's
-        # motion, not cumulative-since-start) alongside the existing
-        # cumulative fields above. Needed for Gate 0 in the module
-        # docstring's accuracy-gate section: cumulative position_error
-        # alone can't distinguish "VO is frozen at a near-identity
-        # transform" (the documented dense-odometry failure mode) from
-        # "VO is genuinely accurate," since a frozen VO reading a robot
-        # that happens to return near its start would ALSO show a small
-        # cumulative error despite never having tracked anything. The
-        # ratio of VO's own reported displacement to ground truth's real
-        # displacement over the same window is a direct, per-tick check
-        # that VO is actually responding to real motion.
+        # Per-interval DELTA (this window's motion, not cumulative-since-
+        # start) alongside the cumulative fields above. Cumulative
+        # position_error alone can't distinguish "VO is frozen at a
+        # near-identity transform" from "VO is genuinely accurate," since
+        # a frozen VO reading a robot that happens to return near its
+        # start would ALSO show a small cumulative error despite never
+        # having tracked anything. The ratio of VO's own reported
+        # displacement to ground truth's real displacement over the same
+        # window is a direct, per-tick check that VO is actually
+        # responding to real motion.
         vo_pos = (vo_pose.position.x, vo_pose.position.y, vo_pose.position.z)
         pos_ratio_str = "n/a"
         yaw_ratio_str = "n/a"
@@ -861,11 +706,11 @@ class DimSimVisualOdometryModule(Module):
         self._last_log_vo_pos = vo_pos
         self._last_log_vo_yaw = vo_yaw
 
-        # PHASE 3 ADDITION (2026-07-20): per-interval rejection-reason
-        # breakdown (see _reject_counts' docstring in __init__) -- reset
-        # every tick so this reports "since last log", matching the delta
-        # fields above, not a slowly-growing cumulative count that gets
-        # harder to read over a long run.
+        # Per-interval rejection-reason breakdown (see _reject_counts'
+        # docstring in __init__) -- reset every tick so this reports
+        # "since last log", matching the delta fields above, not a
+        # slowly-growing cumulative count that gets harder to read over a
+        # long run.
         reject_str = (
             ", ".join(f"{k}={v}" for k, v in sorted(self._reject_counts.items()))
             if self._reject_counts else "none"

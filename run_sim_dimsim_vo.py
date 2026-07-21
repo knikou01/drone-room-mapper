@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Entry point for the DimSim + Visual Odometry Phase 1 blueprint.
+"""Entry point for the DimSim + Visual Odometry blueprint.
 
-Mirrors run_sim_dimsim_detection.py's structure (Vector's existing,
-confirmed-working entry point for the DimSim detection blueprint).
+Mirrors run_sim_dimsim_detection.py's structure.
 
 BEFORE RUNNING:
   1. Start the DimSim relay:
@@ -14,12 +13,11 @@ BEFORE RUNNING:
 
 This does not trigger autonomous exploration automatically -- use
 lcm_probe/start_exploration.py after the blueprint is up, same as the
-existing DimSim detection workflow (per Vector's report, section 1.2).
+existing DimSim detection workflow.
 
 Watch the logs for "VO vs ground-truth" lines -- these report position and
 yaw error between DimSimVisualOdometryModule's estimate and DimSim's real
-ground-truth pose. This is the actual deliverable of Phase 1: a concrete
-accuracy number, not yet a working replacement for ground-truth odom.
+ground-truth pose.
 """
 
 from dimos.core.coordination.module_coordinator import ModuleCoordinator

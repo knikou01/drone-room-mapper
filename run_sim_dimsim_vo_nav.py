@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Entry point for the DimSim Phase 3 blueprint -- NAVIGATION driven by
-real VO (odom_vo). Mapping deliberately stays on ground truth -- see
-blueprints/sim_dimsim_vo_nav_blueprint.py's module docstring SCOPE CHANGE
-section (a live test with mapping also on VO produced a visibly corrupted
-map -- "a lot of walls where they don't belong" -- since mapping has no
+"""Entry point for the DimSim blueprint with NAVIGATION driven by real VO
+(odom_vo). Mapping deliberately stays on ground truth -- see
+blueprints/sim_dimsim_vo_nav_blueprint.py's module docstring (remapping
+mapping to VO too produces a visibly corrupted map, since mapping has no
 self-correction against VO drift the way replanning does).
 
 Mirrors run_sim_dimsim_vo.py's structure.
@@ -41,7 +40,7 @@ if __name__ == "__main__":
         coordinator.stop()
         exit(1)
 
-    print(f"DimSim Phase 3 (VO-driven navigation, ground-truth mapping) started with {coordinator.n_modules} modules.")
+    print(f"DimSim (VO-driven navigation, ground-truth mapping) started with {coordinator.n_modules} modules.")
     print("Trigger exploration separately with: python -m lcm_probe.start_exploration")
     print("Watch logs for 'VO vs ground-truth' lines -- navigation now depends on this accuracy.")
     print("Ctrl+C to stop.")

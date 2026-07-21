@@ -1,18 +1,14 @@
-"""Verify DimSimVisualOdometryModule's odom_vo bootstrap publish
-(2026-07-20 addition).
+"""Verify DimSimVisualOdometryModule's odom_vo bootstrap publish.
 
-Found via a real live Phase 3 navigation run: odom_vo previously only
-published AFTER a successful tracked transform. Once
-WavefrontFrontierExplorer/ReplanningAStarPlanner were remapped to consume
-odom_vo instead of ground truth (sim_dimsim_vo_nav_blueprint.py), this
-created a chicken-and-egg deadlock -- they need at least one odom message
-before picking/pursuing a goal, the robot needs a goal before anything
-commands it to move, and if the spawn view happens to be geometrically
-simple, _compute_transform_sparse's min_point_spread_ratio check correctly
-keeps rejecting every attempt, so VO never gets a chance to succeed either
-without the robot ever moving. Confirmed live: zero "VO vs ground-truth"
-log lines in 90+ seconds of runtime, exploration silently never published
-a single frontier goal.
+Without it, odom_vo only publishes AFTER a successful tracked transform.
+When navigation modules are remapped to consume odom_vo instead of ground
+truth (sim_dimsim_vo_nav_blueprint.py), this creates a chicken-and-egg
+deadlock: they need at least one odom message before picking/pursuing a
+goal, the robot needs a goal before anything commands it to move, and if
+the spawn view happens to be geometrically simple,
+_compute_transform_sparse's min_point_spread_ratio check keeps rejecting
+every attempt, so VO never gets a chance to succeed either without the
+robot ever moving.
 
 Fix: publish an initial odom_vo message immediately when the first
 ground-truth sample arrives, at the same origin-anchor pose the module

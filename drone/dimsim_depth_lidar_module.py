@@ -1,8 +1,6 @@
 """
 DimSimDepthLidarModule
 
-Phase 2 of the visual-SLAM-instead-of-lidar plan (see Vector's DimSim
-technical report, section 4, and DimSimVisualOdometryModule for Phase 1).
 Builds a world-frame PointCloud2 from DimSim's depth image and publishes it
 so it can feed VoxelGridMapper INSTEAD of DimSim's own raycast-based
 /lidar topic -- this is the actual "map with vision, not lidar" swap.
@@ -12,58 +10,42 @@ WHY NOT NAME THE OUTPUT STREAM "lidar" (important, read before changing):
 ------------------------------------------------------------------------
 DimSim's bridge (dimos-cli/bridge/server.ts) publishes its own raycast
 point cloud unconditionally on the raw LCM topic "/lidar#sensor_msgs.
-PointCloud2" -- this happens server-side regardless of what DimOS is doing
-(confirmed from Vector's report, section 1.1/1.3). VoxelGridMapper.lidar:
-In[PointCloud2] currently receives this by DimOS's default name-to-topic
-resolution, with no DimOS module publishing it -- the bare declared stream
-name is enough to subscribe to that literal topic string.
+PointCloud2" -- this happens server-side regardless of what DimOS is doing.
+VoxelGridMapper.lidar: In[PointCloud2] currently receives this by DimOS's
+default name-to-topic resolution, with no DimOS module publishing it --
+the bare declared stream name is enough to subscribe to that literal
+topic string.
 
 If this module ALSO declared Out[PointCloud2] named "lidar", DimOS's
 transport machinery would derive the SAME topic string for publishing,
 colliding with DimSim's own publisher -- both raycast points and
 depth-derived points would land on one topic simultaneously, producing a
-corrupted mixed map rather than a clean replacement. This is the exact
-same collision Vector's DimSimCameraModule docstring already warned about
-for color_image/pointcloud, applied here to lidar specifically.
+corrupted mixed map rather than a clean replacement.
 
 Fix used: this module publishes on "depth_lidar" instead, and the
-blueprint (sim_dimsim_vo_blueprint.py) must use .remappings() to point
-VoxelGridMapper's "lidar" input at this module's "depth_lidar" output
-instead of its default topic resolution -- same .remappings() syntax
-confirmed working in dimos/robot/drone/blueprints/agentic/drone_agentic.py:
-    .remappings([(DroneTrackingModule, "video_input", "video")])
+blueprint must use .remappings() to point VoxelGridMapper's "lidar" input
+at this module's "depth_lidar" output instead of its default topic
+resolution:
+    .remappings([(VoxelGridMapper, "lidar", "depth_lidar")])
 
 VERIFY ON FIRST RUN: check the startup "Transport" log lines for
-VoxelGridMapper's lidar stream -- it should show exactly two endpoints,
-this module and VoxelGridMapper, on a "depth_lidar" (or remapped) topic,
-NOT the original "/lidar" topic. If VoxelGridMapper is still receiving
-DimSim's raw raycast data instead, the remapping did not take effect.
+VoxelGridMapper's lidar stream -- it should show a "depth_lidar" (or
+remapped) topic, NOT the original "/lidar" topic. If VoxelGridMapper is
+still receiving DimSim's raw raycast data instead, the remapping did not
+take effect.
 ------------------------------------------------------------------------
 
-Pose source: a standard DimOS `odom: In[PoseStamped]` stream (PHASE 3
-CHANGE, 2026-07-20 -- was a hardcoded raw-LCM `/odom` subscription,
-identical in effect but not remappable via blueprint .remappings() the
-way every other pose-consuming module in this codebase is). Ground truth
-`/odom` still resolves here by DEFAULT (DimOS's name-based topic
-resolution for a stream literally named "odom" happens to match DimSim's
-raw ground-truth topic string, same reasoning as
-ReplanningAStarPlanner.odom/WavefrontFrontierExplorer.odom -- see
-sim_dimsim_vo_nav_blueprint.py) -- but a blueprint can now remap this to
-`odom_vo` just like those, so the MAP itself (not just navigation
-decisions) can be built entirely from VO instead of ground truth. Only
-the odom subscription changed -- the depth-image subscription below stays
-on the raw-LCM pattern, since that one exists for a different, still-valid
-reason (DimSim's bridge publishes depth unconditionally regardless of
-blueprint, matching DimSimCameraModule's own color-image pattern).
-
-Projection math verified in test_depth_lidar_projection.py against
-synthetic flat-wall geometry at two headings before this module was
-written, reusing the same camera-frame axis remap already applied (and
-flagged unvalidated in real conditions) in DimSimVisualOdometryModule.
-_camera_to_world_pose. If the map this module produces looks
-geometrically wrong once running, that remap is the first place to check
--- it's shared code-in-spirit between both modules, verified only against
-synthetic data in both cases, not yet against DimSim's real output.
+Pose source: a standard DimOS `odom: In[PoseStamped]` stream. Ground truth
+`/odom` resolves here by DEFAULT (DimOS's name-based topic resolution for
+a stream literally named "odom" happens to match DimSim's raw
+ground-truth topic string, same reasoning as
+ReplanningAStarPlanner.odom/WavefrontFrontierExplorer.odom) -- but a
+blueprint can remap this to `odom_vo` just like those, so the map itself
+(not just navigation decisions) can be built from VO instead of ground
+truth. The depth-image subscription below stays on the raw-LCM pattern
+(a different, still-valid reason: DimSim's bridge publishes depth
+unconditionally regardless of blueprint, matching DimSimCameraModule's
+own color-image pattern).
 """
 from __future__ import annotations
 
@@ -96,10 +78,9 @@ class DimSimDepthLidarConfig(ModuleConfig):
     min_depth_m: float = 0.05
     max_depth_m: float = 15.0
     # Sample every Nth pixel in each dimension. DimSim's capture resolution
-    # is 640x288 (confirmed from dimsim_camera_module.py); stride=4 gives
-    # 160x72 = 11520 candidate points per frame before depth filtering --
-    # comparable in density to DimSim's own 20K-point raycast lidar
-    # (per Vector's report, section 1.3) without being excessive at ~2Hz.
+    # is 640x288; stride=4 gives 160x72 = 11520 candidate points per frame
+    # before depth filtering -- comparable in density to DimSim's own
+    # 20K-point raycast lidar without being excessive at ~2Hz.
     depth_sample_stride: int = 4
 
 
@@ -112,9 +93,7 @@ class DimSimDepthLidarModule(Module):
 
     config: DimSimDepthLidarConfig
 
-    # PHASE 3 CHANGE (2026-07-20): was a hardcoded raw-LCM "/odom"
-    # subscription -- see module docstring's "Pose source" section. Named
-    # "odom" (not e.g. "pose") specifically so it matches
+    # Named "odom" (not e.g. "pose") specifically so it matches
     # ReplanningAStarPlanner.odom/WavefrontFrontierExplorer.odom's own
     # default DimOS topic resolution, and so the SAME .remappings() entry
     # style used for those (`(cls, "odom", "odom_vo")`) works here too.
@@ -176,13 +155,10 @@ class DimSimDepthLidarModule(Module):
         self.depth_lidar.publish(cloud)
 
     def _project_to_world(self, depth_msg: Image) -> np.ndarray:
-        """Depth image -> world-frame points.
-
-        See module docstring: this remap is shared in spirit with
-        DimSimVisualOdometryModule._camera_to_world_pose and verified only
-        against synthetic geometry (test_depth_lidar_projection.py), not
-        yet against DimSim's real output.
-        """
+        """Depth image -> world-frame points. The camera-frame axis remap
+        below is shared in spirit with DimSimVisualOdometryModule.
+        _camera_to_world_pose; see test_depth_lidar_projection.py for the
+        synthetic verification of this projection."""
         depth_mm = depth_msg.data
         h, w = depth_mm.shape[:2]
         depth_m = depth_mm.astype(np.float32) / 1000.0  # 16UC1 mm -> metres,

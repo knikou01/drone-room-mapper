@@ -9,25 +9,23 @@ DimSim's bridge (dimos-cli/bridge/server.ts) publishes on the literal topics
 "/lidar#sensor_msgs.PointCloud2" unconditionally, regardless of what DimOS
 blueprint is running.
 
-CONFIRMED BUG, FIXED (2026-07-08): this module's Out[Image] stream was
-originally named "color_image", which DimOS's transport-building logic
-(_get_transport_for in module_coordinator.py, `topic = f"/{name}"`) resolves
-to the literal topic "/color_image" -- the EXACT same topic DimSim's bridge
+This module's Out[Image] stream is deliberately NOT named "color_image":
+DimOS's transport-building logic (_get_transport_for in
+module_coordinator.py, `topic = f"/{name}"`) would resolve that name to
+the literal topic "/color_image" -- the EXACT same topic DimSim's bridge
 publishes raw frames on. Subscribing to the raw topic as input does NOT
-avoid a same-name Out stream from colliding with it on the output side; the
-publish still goes out via DimOS's own transport onto that identical topic.
-Confirmed via direct test that two independent same-process LCM() instances
-DO see each other's publishes on a shared topic (no self-echo filtering) --
-so this module's own raw `self._lcm` subscription received its own
-republished frame, re-triggering _on_color_image, in an unbounded feedback
-loop that flooded /color_image with duplicate stale frames. This starved out
-real frames and was traced as the root cause of DimSimVisualOdometryModule's
-VO pose reading as frozen (identical consecutive frames -> near-identity
-odometry transform every time) and of the Rerun camera panel not showing a
-live feed. Fixed by renaming the Out stream to "dimsim_color_image", which
-resolves to a non-colliding topic. Downstream consumers (ObjectDBModule) are
-wired via blueprint .remappings() back to this stream -- see
-sim_dimsim_vo_blueprint.py / sim_detection_dimsim_blueprint.py.
+avoid a same-name Out stream from colliding with it on the output side;
+the publish still goes out via DimOS's own transport onto that identical
+topic. Two independent same-process LCM() instances see each other's
+publishes on a shared topic (no self-echo filtering), so a same-named Out
+stream would receive its own republished frame back as input, re-
+triggering _on_color_image in an unbounded feedback loop that floods
+/color_image with duplicate stale frames -- starving out real frames and
+freezing anything downstream that depends on frame-to-frame change (e.g.
+visual odometry). The Out stream is named "dimsim_color_image" instead,
+which resolves to a non-colliding topic. Downstream consumers
+(ObjectDBModule) are wired via blueprint .remappings() back to this
+stream -- see sim_dimsim_vo_blueprint.py / sim_detection_dimsim_blueprint.py.
 Rerun's camera view does NOT need a remap: RerunBridgeModule subscribes to
 the entire raw LCM bus directly (subscribe_all()), so it already picks up
 DimSim's actual /color_image topic itself, independent of this module.

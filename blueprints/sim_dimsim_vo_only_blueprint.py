@@ -1,22 +1,17 @@
 """DimSim VO-only validation blueprint.
 
-Stripped-down variant of sim_dimsim_vo_blueprint.py for isolating whether
-DimSimVisualOdometryModule's real-motion under-tracking (observed in a live
-run: gt_yaw swinging ~165+ degrees of real rotation while vo_yaw stayed
-within about +-1.1 degrees) is a real accumulation/tracking bug or an
-artifact of system load. That run also showed pairing_gap jumping from the
-usual ~200ms to over 1000ms, and hit a real
-"RuntimeError: LCM handler thread failed to start within 5s" crash in
-ObjectDBModule's cropped-image publishing thread -- both signs of the
-process being overloaded, not necessarily a code bug in VO itself.
+Stripped-down variant of sim_dimsim_vo_blueprint.py for isolating
+DimSimVisualOdometryModule's tracking accuracy from system load --
+ObjectDBModule's per-frame detection/tracking work is heavy enough that it
+can starve VO of CPU and inflate pairing_gap on its own, independent of
+any real tracking bug.
 
 Deliberately DROPPED relative to sim_dimsim_vo_blueprint.py, none of which
 VO itself depends on (it reads DimSim's raw /color_image, /depth_image,
 /odom directly via its own standalone LCM() instance -- see its module
 docstring):
-  - ObjectDBModule        (heaviest module here -- ran real detection/
-                            tracking per frame; the actual crash source
-                            in the run that prompted this blueprint)
+  - ObjectDBModule        (heaviest module here -- real per-frame
+                            detection/tracking work)
   - CostMapper, WavefrontFrontierExplorer, ReplanningAStarPlanner
                           (autonomous exploration -- not used, this is a
                             pure manual-teleop test)
@@ -100,20 +95,15 @@ _vis = vis_module(global_config.viewer, rerun_config=_rerun_config)
 sim_dimsim_vo_only = autoconnect(
     _vis,
     DimSimCameraModule.blueprint(),
-    # PHASE 3 RE-TEST (2026-07-20), RULED OUT: tracking_method="dense" was
-    # tried here explicitly, since Direction B's async DimSim readback
-    # fix removed dense odometry's original blocker (the ~1-1.2s
-    # pairing_gap breaking its small-motion assumption). Confirmed live
-    # this does NOT help and is actually worse than "sparse": under real
-    # (non-best-case) load, pairing_gap still varied 1000-13000ms in this
-    # run, and dense reproduced its exact original documented failure
-    # mode -- success_rate climbed to 95-97% while the tracked pose was
-    # frozen/near-identity (e.g. vo=0.014m/0.0deg while the robot had
-    # actually moved gt=0.521m/82.5deg). That's a materially WORSE failure
-    # mode than sparse's low success rate: dense reports confident false
-    # success instead of failing safely. Left as module default ("sparse")
-    # -- do not re-enable dense without new evidence changing this
-    # conclusion.
+    # tracking_method="dense" was re-tested here after fixing DimSim's
+    # capture-pipeline stall, since that fix removed dense odometry's
+    # original blocker (a large color/depth pairing_gap breaking its
+    # small-motion assumption). Still worse than "sparse": dense reports
+    # confident false success (success_rate 95-97%) while the tracked pose
+    # stays frozen/near-identity during real motion -- a materially worse
+    # failure mode than sparse's lower but honest success rate. Left as
+    # module default ("sparse") -- do not re-enable dense without new
+    # evidence.
     DimSimVisualOdometryModule.blueprint(),
     MovementManager.blueprint(),
 )

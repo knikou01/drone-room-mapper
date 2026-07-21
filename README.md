@@ -154,17 +154,16 @@ accuracy improves, not as a working alternative today.
   VO) made real, confirmed progress but did not reach a reliable end
   state — see `drone/dimsim_visual_odometry_module.py`'s module docstring
   for the full evidence trail. What's actually true as of this pass:
-  - **Root cause of the original "VO barely moves at all" symptom,
-    confirmed via direct source reads of `../DimSim`:** its image-capture
-    path did a synchronous, GPU-pipeline-stalling pixel readback on every
-    frame (confirmed live via a real "GPU stall due to ReadPixels" driver
+  - **Root cause of the original "VO barely moves at all" symptom:** its
+    image-capture path did a synchronous, GPU-pipeline-stalling pixel
+    readback on every frame (a real "GPU stall due to ReadPixels" driver
     warning), causing `pairing_gap` (time between usable frames) to blow
     out from a 200ms design target to as much as 60+ seconds under load.
     Fixed in `../DimSim` (`engine.js`/`dimosBridge.ts`) by switching to
     Three.js's async, WebGL2-PBO-based `readRenderTargetPixelsAsync()` —
-    confirmed live this holds `pairing_gap` near the 200ms target under
-    light load, though it can still degrade to several seconds under
-    heavier load (not perfectly solved, meaningfully improved).
+    this holds `pairing_gap` near the 200ms target under light load,
+    though it can still degrade to several seconds under heavier load (not
+    perfectly solved, meaningfully improved).
   - **`DimSimVisualOdometryModule` was rewritten to track via ORB feature
     matching + depth-based 3D-3D RANSAC** (`tracking_method="sparse"`,
     now the default) instead of dense frame-to-frame photometric
@@ -188,8 +187,8 @@ accuracy improves, not as a working alternative today.
     (`too_few_orb_features`/`too_few_orb_matches`/`degenerate_geometry`
     dominating, not just the safety filters). This is a content/rendering
     characteristic of the simulated scenes, not a tuning problem alone.
-  - **Decision (2026-07-20): decouple navigation from mapping rather than
-    swap both onto VO together.** A live test with both remapped produced
+  - **Decision: decouple navigation from mapping rather than swap both
+    onto VO together.** A live test with both remapped produced
     a visibly corrupted map ("walls where they don't belong") — mapping
     (`DimSimDepthLidarModule`) has zero self-correction against VO drift
     (every point gets projected into world coordinates and permanently

@@ -32,23 +32,20 @@ Stream wiring (mostly (name, type) auto-match via autoconnect; one
   dimsim_color_image / pointcloud   <- DimSimCameraModule (Out, internal)
                                      -> ObjectDBModule (In, via remap)
 
-CONFIRMED BUG, FIXED (2026-07-08): DimSimCameraModule's image stream used to
-be named "color_image", colliding with DimSim's own raw /color_image topic
-and creating a self-triggering republish feedback loop (see
-dimsim_camera_module.py's module docstring for the full trace). Now named
-"dimsim_color_image"; ObjectDBModule's In[Image] "color_image" is wired to
-it via .remappings() below instead of relying on name auto-match.
+DimSimCameraModule's image stream is named "dimsim_color_image", not
+"color_image" -- avoids colliding with DimSim's own raw /color_image topic
+(see dimsim_camera_module.py's module docstring for why that collision is
+a real problem, not just a naming nitpick). ObjectDBModule's In[Image]
+"color_image" is wired to it via .remappings() below instead of relying on
+name auto-match.
 
-NOT YET VERIFIED (flagging explicitly, same discipline as prior work in this
-project): whether DimOS's own LCM transport and DimSim's vendored LCM
-implementation actually agree byte-for-byte on encoding for every message
-type used here. Image/PointCloud2/PoseStamped were directly confirmed via
-lcm_probe/probe.py. Twist was NOT independently probed in the
-DimOS->DimSim direction before this blueprint was written — only inferred
+Image/PointCloud2/PoseStamped encoding compatibility between DimOS's own
+LCM transport and DimSim's vendored LCM implementation was confirmed via
+lcm_probe/probe.py. Twist (DimOS -> DimSim direction) was only inferred
 from physics.ts's CH_CMD_VEL constant and handleCmdVel's field access
-matching DimOS's Twist.linear.x/.angular.z shape. Recommend running this
-blueprint once and confirming in the browser that the agent actually moves
-before trusting frontier exploration results.
+matching DimOS's Twist.linear.x/.angular.z shape, not independently
+probed -- if the agent doesn't move when this blueprint runs, check that
+first.
 """
 from typing import Any
 
